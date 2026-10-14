@@ -1,5 +1,7 @@
 # Strata Studio
 
+![Strata Studio](docs/images/stratastudio-image.png)
+
 [日本語](README.ja.md) · [简体中文](README.zh-CN.md)
 
 A Tauri 2 inference workbench and Rust API gateway for the existing [Strata](https://github.com/Niko1221/Strata) engine. macOS builds target Apple Silicon; inference uses Strata's native Metal backend. The upstream source in `Strata/` is unchanged.

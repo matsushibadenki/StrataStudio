@@ -1,5 +1,7 @@
 # Strata Studio
 
+![Strata Studio](docs/images/stratastudio-image.png)
+
 [English](README.md) · [日本語](README.ja.md)
 
 用于Strata推理引擎的Tauri 2桌面界面与Rust API网关。macOS构建面向Apple Silicon，推理使用现有Strata Metal后端。

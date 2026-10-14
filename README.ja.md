@@ -1,5 +1,7 @@
 # Strata Studio
 
+![Strata Studio](docs/images/stratastudio-image.png)
+
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 Strata推論エンジン用のTauri 2 GUIとRust APIゲートウェイです。Apple Silicon向けにビルドし、推論には既存StrataのMetal実装を使用します。
