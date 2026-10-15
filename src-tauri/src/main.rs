@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 struct Runtime {
     studio: Arc<studio_core::Studio>,
     shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -75,8 +76,69 @@ async fn dock_panel(
     }
     Ok(())
 }
+#[tauri::command]
+async fn select_path(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
+    if !["root", "config", "python", "models"].contains(&kind.as_str()) {
+        return Err("Unknown selection type".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog().file();
+        let selected = if kind == "root" || kind == "models" {
+            dialog.blocking_pick_folder()
+        } else if kind == "config" {
+            dialog
+                .add_filter("Strata config", &["json"])
+                .blocking_pick_file()
+        } else {
+            dialog.blocking_pick_file()
+        };
+        selected
+            .map(|p| {
+                p.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn quit_app(app: tauri::AppHandle, runtime: State<'_, Runtime>) -> Result<(), String> {
+    runtime.studio.shutdown().await.map_err(|e| e.to_string())?;
+    app.exit(0);
+    Ok(())
+}
+#[tauri::command]
+async fn export_conversation(
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+) -> Result<Option<String>, String> {
+    let messages = runtime.studio.document.read().await.messages.clone();
+    let data = serde_json::to_vec_pretty(&serde_json::json!({"version": 1, "messages": messages}))
+        .map_err(|e| e.to_string())?;
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name("Strata-conversation.json")
+            .add_filter("JSON", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(file) = selected {
+        let path = file.into_path().map_err(|e| e.to_string())?;
+        tokio::fs::write(&path, data)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    } else {
+        Ok(None)
+    }
+}
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = std::env::var_os("STRATA_ROOT")
                 .map(PathBuf::from)
@@ -105,6 +167,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             connection,
+            quit_app,
+            export_conversation,
+            select_path,
             float_panel,
             dock_panel
         ])
@@ -113,7 +178,7 @@ fn main() {
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 let runtime = app.state::<Runtime>();
-                tauri::async_runtime::block_on(runtime.studio.stop()).ok();
+                tauri::async_runtime::block_on(runtime.studio.shutdown()).ok();
                 if let Some(tx) = runtime.shutdown.lock().unwrap().take() {
                     let _ = tx.send(());
                 };

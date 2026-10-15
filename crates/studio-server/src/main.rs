@@ -24,9 +24,9 @@ async fn axum_serve(
     let signal_cleanup = cleanup.clone();
     studio_core::serve(listener, state, async move {
         let _ = tokio::signal::ctrl_c().await;
-        let _ = signal_cleanup.stop().await;
+        let _ = signal_cleanup.shutdown().await;
     })
     .await?;
-    cleanup.stop().await.map_err(std::io::Error::other)?;
+    cleanup.shutdown().await.map_err(std::io::Error::other)?;
     Ok(())
 }

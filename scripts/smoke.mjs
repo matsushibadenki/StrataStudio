@@ -1,3 +1,4 @@
+import { preferences, closePreferences, language } from "./ui-helpers.mjs";
 import { chromium } from "@playwright/test";
 import assert from "node:assert/strict";
 const browser = await chromium.launch({
@@ -7,12 +8,17 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
+page.on("console", (message) => {
+  if (message.type() === "error") errors.push(message.text());
+});
 try {
   await page.goto("http://127.0.0.1:5180");
-  await page.getByRole("button", { name: "English", exact: true }).click();
+  await language(page, "English");
+  await preferences(page, "engine");
   await page
     .getByRole("button", { name: "Start", exact: true })
     .waitFor({ state: "visible" });
+  await closePreferences(page);
   await page.getByRole("button", { name: "New conversation" }).click();
   await page.waitForFunction(
     () =>
@@ -20,6 +26,7 @@ try {
   );
   await page.screenshot({ path: "/tmp/strata-studio-desktop.png" });
   assert.equal(await page.title(), "Strata Studio");
+  await preferences(page, "engine");
   await page
     .getByRole("textbox", { name: "Python path", exact: true })
     .fill(process.env.STUDIO_TEST_PYTHON || "python3");
@@ -29,6 +36,7 @@ try {
     () => document.querySelector(".value-row .status")?.textContent === "Ready",
     { timeout: 30000 },
   );
+  await closePreferences(page);
   await page
     .getByRole("textbox", { name: "Type a message…" })
     .fill("Hello Strata");
@@ -104,6 +112,7 @@ try {
     403,
   );
   await page.screenshot({ path: "/tmp/strata-studio-chat.png" });
+  await preferences(page, "engine");
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await page.waitForFunction(
     () =>
@@ -113,10 +122,13 @@ try {
     (await fetch("http://127.0.0.1:8080/v1/models", { headers })).status,
     503,
   );
+  await closePreferences(page);
   await page.getByRole("button", { name: "New conversation" }).click();
-  await page.getByRole("button", { name: "简体中文", exact: true }).click();
+  await language(page, "简体中文");
+  await closePreferences(page);
   await page.getByText("从这里开始推理。", { exact: true }).waitFor();
-  await page.getByRole("button", { name: "日本語", exact: true }).click();
+  await language(page, "日本語");
+  await closePreferences(page);
   await page.getByText("推論を、ここから。", { exact: true }).waitFor();
   for (const width of [320, 375, 414, 768, 1440, 1536]) {
     await page.setViewportSize({ width, height: width === 1536 ? 1024 : 960 });

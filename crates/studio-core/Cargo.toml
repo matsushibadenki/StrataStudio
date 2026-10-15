@@ -13,3 +13,5 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 tokio-stream = "0.1"
+
+rusqlite = { version = "0.32.1", features = ["bundled"] }

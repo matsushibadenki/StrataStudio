@@ -1,3 +1,9 @@
+pub mod catalog;
+pub mod layout;
+pub mod local_model;
+pub mod memory_usage;
+pub mod metal_policy;
+pub mod preparation;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -26,6 +32,10 @@ pub struct Settings {
     pub temperature: f64,
     pub max_tokens: u32,
     pub language: String,
+    #[serde(default)]
+    pub model_directories: Vec<String>,
+    #[serde(default)]
+    pub metal_memory: metal_policy::MemorySettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -37,6 +47,8 @@ impl Default for Settings {
             temperature: 0.7,
             max_tokens: 512,
             language: "ja".into(),
+            model_directories: Vec::new(),
+            metal_memory: metal_policy::MemorySettings::default(),
         }
     }
 }
@@ -52,11 +64,14 @@ pub struct Document {
     pub detached: Vec<String>,
     #[serde(default)]
     pub generating: bool,
+    #[serde(default)]
+    pub layout: layout::Layout,
 }
 struct Process {
     child: Option<Child>,
     key: String,
     port: u16,
+    memory: Option<Value>,
 }
 pub struct Studio {
     pub root: PathBuf,
@@ -69,6 +84,10 @@ pub struct Studio {
     client: reqwest::Client,
     storage: Mutex<Option<PathBuf>>,
     memory_bytes: Option<u64>,
+    memory_usage: Mutex<memory_usage::Monitor>,
+    preparation: Mutex<preparation::Preparation>,
+    lifecycle: Mutex<()>,
+    catalog: Mutex<Option<catalog::CachedScan>>,
 }
 impl Studio {
     pub fn new(root: PathBuf, port: u16) -> Self {
@@ -109,10 +128,15 @@ impl Studio {
                 child: None,
                 key: String::new(),
                 port: 0,
+                memory: None,
             }),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             client: reqwest::Client::new(),
             storage: Mutex::new(None),
+            preparation: Mutex::new(preparation::Preparation::default()),
+            lifecycle: Mutex::new(()),
+            catalog: Mutex::new(None),
+            memory_usage: Mutex::new(memory_usage::Monitor::default()),
             memory_bytes: if cfg!(target_os = "macos") {
                 std::process::Command::new("/usr/sbin/sysctl")
                     .args(["-n", "hw.memsize"])
@@ -134,6 +158,9 @@ impl Studio {
                     *self.settings.get_mut() = settings;
                 }
                 if let Ok(mut doc) = serde_json::from_value::<Document>(value["document"].clone()) {
+                    if doc.layout.validate().is_err() {
+                        doc.layout = layout::Layout::default();
+                    }
                     doc.generating = false;
                     doc.detached.clear(); // Native windows do not survive a process restart.
                     *self.document.get_mut() = doc;
@@ -170,8 +197,18 @@ impl Studio {
         Ok(())
     }
     pub async fn stop(&self) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_inner().await
+    }
+    async fn stop_inner(&self) -> Result<(), String> {
         let mut p = self.process.lock().await;
         if let Some(mut c) = p.child.take() {
+            if p.memory.is_some() {
+                self.memory_usage
+                    .lock()
+                    .await
+                    .refresh(self.memory_bytes, None);
+            }
             #[cfg(unix)]
             if let Some(id) = c.id() {
                 unsafe {
@@ -195,6 +232,13 @@ impl Studio {
         Ok(())
     }
     pub async fn start(&self) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.start_inner().await
+    }
+    async fn start_inner(&self) -> Result<(), String> {
+        if self.preparation.lock().await.busy() {
+            return Err("Wait for model preparation to finish".into());
+        }
         let mut p = self.process.lock().await;
         if let Some(c) = p.child.as_mut() {
             if c.try_wait().map_err(|e| e.to_string())?.is_none() {
@@ -211,6 +255,34 @@ impl Studio {
                 return Err(
                     "Select an existing strata-*.json config produced by Strata/setup.sh".into(),
                 );
+            }
+        }
+        if !s.mock {
+            let info = preparation::inspect_config(&PathBuf::from(&s.config), &root);
+            if !info.valid {
+                return Err(info.error.unwrap_or("Invalid Strata engine config".into()));
+            }
+            if !info.engine_exists {
+                return Err("Configured engine executable was not found".into());
+            }
+            if !info.tokenizer_exists {
+                return Err("Configured tokenizer/vocab.json was not found".into());
+            }
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                if let Some(profile) = metal_policy::apply_with_settings(
+                    &PathBuf::from(&s.config),
+                    self.memory_bytes,
+                    &s.metal_memory,
+                )? {
+                    push_log(
+                        &self.logs,
+                        format!(
+                            "[studio] Metal memory settings: context {}, prompt chunk {}",
+                            profile.context, profile.prompt_chunk
+                        ),
+                    )
+                    .await;
+                }
             }
         }
         let probe = tokio::time::timeout(Duration::from_secs(10), Command::new(&s.python)
@@ -262,7 +334,22 @@ impl Studio {
         if let Some(out) = child.stderr.take() {
             pump(out, self.logs.clone());
         }
+        p.memory = if s.mock {
+            None
+        } else {
+            metal_policy::preview(
+                &PathBuf::from(&s.config),
+                self.memory_bytes,
+                &s.metal_memory,
+            )
+        };
         p.child = Some(child);
+        if !s.mock {
+            self.memory_usage
+                .lock()
+                .await
+                .refresh(self.memory_bytes, p.child.as_ref().and_then(|c| c.id()));
+        }
         push_log(
             &self.logs,
             format!(
@@ -277,6 +364,64 @@ impl Studio {
         )
         .await;
         Ok(())
+    }
+    async fn engine_pid(&self) -> Option<u32> {
+        let mut p = self.process.lock().await;
+        if p.memory.is_none() {
+            return None;
+        } // Mock engines are not Strata.
+        let c = p.child.as_mut()?;
+        if !matches!(c.try_wait(), Ok(None)) {
+            return None;
+        }
+        c.id()
+    }
+    async fn capture_memory(&self) {
+        let pid = self.engine_pid().await;
+        self.memory_usage
+            .lock()
+            .await
+            .capture(self.memory_bytes, pid);
+    }
+    pub async fn apply_memory_restart(
+        &self,
+        memory: metal_policy::MemorySettings,
+    ) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !memory.valid(self.memory_bytes) {
+            return Err("Invalid Metal memory settings".into());
+        }
+        if self.preparation.lock().await.busy() {
+            return Err("Wait for model preparation to finish".into());
+        }
+        if self.document.read().await.generating {
+            return Err("Wait for the current reply to finish".into());
+        }
+        let previous = self.settings.read().await.metal_memory.clone();
+        self.capture_memory().await;
+        self.memory_usage.lock().await.event(
+            "settings",
+            Some(if memory.automatic {
+                metal_policy::automatic(self.memory_bytes)["context"]
+                    .as_u64()
+                    .unwrap_or(memory.context as u64) as u32
+            } else {
+                memory.context
+            }),
+        );
+        self.stop_inner().await?;
+        self.settings.write().await.metal_memory = memory;
+        if let Err(error) = self.persist().await {
+            self.settings.write().await.metal_memory = previous;
+            let recovery = self.start_inner().await;
+            return Err(format!(
+                "Cannot save memory settings: {error}; previous engine recovery: {}",
+                recovery.err().unwrap_or_else(|| "ok".into())
+            ));
+        }
+        self.start_inner()
+            .await
+            .map_err(|e| format!("Memory settings saved, but engine restart failed: {e}"))
     }
     pub async fn snapshot(&self) -> Value {
         let (running, upstream, key) = {
@@ -302,6 +447,8 @@ impl Studio {
             Some(h) => h.json::<Value>().await.ok(),
             None => None,
         };
+        let settings = self.settings.read().await.clone();
+        let memory_tuning = json!({"automatic":metal_policy::automatic(self.memory_bytes),"next":metal_policy::preview(&PathBuf::from(&settings.config),self.memory_bytes,&settings.metal_memory),"active":if running { self.process.lock().await.memory.clone() } else { None }});
         let status = if !running {
             "offline"
         } else if health.is_some() {
@@ -309,7 +456,13 @@ impl Studio {
         } else {
             "starting"
         };
-        json!({"status":status,"health":health,"settings":*self.settings.read().await,"document":*self.document.read().await,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
+        let pid = self.engine_pid().await;
+        let memory_usage = self
+            .memory_usage
+            .lock()
+            .await
+            .snapshot(self.memory_bytes, pid);
+        json!({"memoryUsage":memory_usage,"memoryTuning":memory_tuning,"preparation":self.preparation.lock().await.snapshot(),"status":status,"health":health,"settings":*self.settings.read().await,"document":*self.document.read().await,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
     }
 }
 fn pump<T: tokio::io::AsyncRead + Unpin + Send + 'static>(
@@ -347,6 +500,12 @@ async fn session(State(s): State<Arc<Studio>>, h: HeaderMap) -> Response {
     }
     Json(json!({"token":s.token,"url":format!("http://127.0.0.1:{}",s.port)})).into_response()
 }
+async fn inspect(State(s): State<Arc<Studio>>, h: HeaderMap) -> Response {
+    if !authorized(&h, &s) {
+        return error(StatusCode::UNAUTHORIZED, "Studio token required");
+    }
+    Json(s.inspect().await).into_response()
+}
 async fn snapshot(State(s): State<Arc<Studio>>, h: HeaderMap) -> Response {
     if !authorized(&h, &s) {
         return error(StatusCode::UNAUTHORIZED, "Studio token required");
@@ -359,6 +518,41 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
     }
     let result = match v["action"].as_str().unwrap_or("") {
         "start" => s.start().await,
+        "applyMemoryRestart" => match serde_json::from_value(v["memory"].clone()) {
+            Ok(memory) => s.apply_memory_restart(memory).await,
+            Err(_) => Err("Invalid Metal memory settings".into()),
+        },
+        "prepare" => {
+            s.prepare(
+                v["model"].as_str().unwrap_or(""),
+                v["confirmed"].as_bool().unwrap_or(false),
+            )
+            .await
+        }
+        "inspectLocalModel" => {
+            return match s.inspect_local(v["path"].as_str().unwrap_or("")).await {
+                Ok(info) => Json(info).into_response(),
+                Err(e) => error(StatusCode::BAD_REQUEST, e),
+            };
+        }
+        "useLocalModel" => {
+            s.use_local(
+                v["path"].as_str().unwrap_or(""),
+                v["confirmed"].as_bool().unwrap_or(false),
+            )
+            .await
+        }
+        "cancelPreparation" => s.cancel_preparation().await,
+        "layout" => {
+            let mut document = s.document.write().await;
+            match document.layout.patch(&v["layout"]) {
+                Ok(layout) => {
+                    document.layout = layout;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         "stop" => s.stop().await,
         "settings" => match serde_json::from_value::<Settings>(v["settings"].clone()) {
             Ok(settings)
@@ -366,8 +560,37 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
                     && settings.max_tokens <= 262144
                     && settings.temperature.is_finite()
                     && (0.0..=2.0).contains(&settings.temperature)
-                    && ["en", "ja", "zh"].contains(&settings.language.as_str()) =>
+                    && ["en", "ja", "zh"].contains(&settings.language.as_str())
+                    && catalog::valid_directories(&settings.model_directories)
+                    && settings.metal_memory.valid(s.memory_bytes) =>
             {
+                let _lifecycle = s.lifecycle.lock().await;
+                if s.preparation.lock().await.busy() {
+                    return error(
+                        StatusCode::CONFLICT,
+                        "Settings are locked during model preparation",
+                    );
+                }
+                if settings.metal_memory != s.settings.read().await.metal_memory {
+                    let mut process = s.process.lock().await;
+                    if process
+                        .child
+                        .as_mut()
+                        .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+                    {
+                        return error(
+                            StatusCode::CONFLICT,
+                            "Stop the engine before changing memory settings",
+                        );
+                    }
+                }
+                if settings.metal_memory != s.settings.read().await.metal_memory {
+                    s.capture_memory().await;
+                    s.memory_usage
+                        .lock()
+                        .await
+                        .event("settings", Some(settings.metal_memory.context));
+                }
                 *s.settings.write().await = settings;
                 Ok(())
             }
@@ -460,13 +683,26 @@ async fn proxy(State(s): State<Arc<Studio>>, req: Request) -> Response {
             request = request.header(name, value);
         }
     }
+    let inference = if matches!(
+        path.split('?').next(),
+        Some("/v1/chat/completions" | "/v1/completions" | "/v1/messages")
+    ) {
+        Some(InferenceGuard::new(s.clone()).await)
+    } else {
+        None
+    };
     let upstream = match request.send().await {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_GATEWAY, e),
     };
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    use tokio_stream::StreamExt;
+    let stream = upstream.bytes_stream().map(move |chunk| {
+        let _ = &inference;
+        chunk
+    });
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     for name in ["content-type", "cache-control"] {
         if let Some(value) = headers.get(name) {
@@ -474,6 +710,22 @@ async fn proxy(State(s): State<Arc<Studio>>, req: Request) -> Response {
         }
     }
     response
+}
+// The guard closes intervals on success, request failure and client disconnect.
+struct InferenceGuard(Arc<Studio>);
+impl InferenceGuard {
+    async fn new(s: Arc<Studio>) -> Self {
+        s.memory_usage.lock().await.inference(true);
+        Self(s)
+    }
+}
+impl Drop for InferenceGuard {
+    fn drop(&mut self) {
+        let s = self.0.clone();
+        tokio::spawn(async move {
+            s.memory_usage.lock().await.inference(false);
+        });
+    }
 }
 // The conversation and in-flight generation live here, rather than in a WebView.
 async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<Value>) -> Response {
@@ -492,6 +744,7 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
         }
         _ => return error(StatusCode::BAD_REQUEST, "Invalid user message"),
     };
+    let lifecycle = s.lifecycle.lock().await;
     let (port, key) = {
         let mut p = s.process.lock().await;
         if !p
@@ -520,6 +773,8 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
             content: String::new(),
         });
     }
+    let inference = InferenceGuard::new(s.clone()).await;
+    drop(lifecycle);
     let response = s
         .client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
@@ -548,6 +803,7 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
+        let _inference = inference;
         let mut buffer = Vec::<u8>::new();
         loop {
             let chunk = tokio::select! {_ = tx.closed()=>break,chunk=response.chunk()=>chunk};
@@ -614,6 +870,8 @@ pub fn router(s: Arc<Studio>) -> Router {
     Router::new()
         .route("/studio/session", post(session))
         .route("/studio/state", get(snapshot))
+        .route("/studio/inspect", get(inspect))
+        .route("/studio/models", get(catalog::scan_handler))
         .route("/studio/action", post(action))
         .route("/studio/chat", post(chat))
         .route(
@@ -644,14 +902,68 @@ pub async fn serve(
     s: Arc<Studio>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(s))
-        .with_graceful_shutdown(shutdown)
-        .await
+    let monitor = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let pid = s.engine_pid().await;
+            s.memory_usage.lock().await.refresh(s.memory_bytes, pid);
+        }
+    };
+    tokio::select! {
+        result = axum::serve(listener, router(s.clone())).with_graceful_shutdown(shutdown) => result,
+        _ = monitor => unreachable!(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn memory_restart_checks_before_stopping_or_saving() {
+        let s = Studio::new(PathBuf::new(), 8080);
+        let before = s.settings.read().await.metal_memory.clone();
+        let mut changed = before.clone();
+        changed.context = 0;
+        assert!(s
+            .apply_memory_restart(changed)
+            .await
+            .unwrap_err()
+            .contains("Invalid"));
+        s.document.write().await.generating = true;
+        let mut changed = before.clone();
+        changed.automatic = false;
+        changed.context = 4096;
+        assert!(s
+            .apply_memory_restart(changed)
+            .await
+            .unwrap_err()
+            .contains("reply"));
+        assert_eq!(s.settings.read().await.metal_memory, before);
+    }
+    #[tokio::test]
+    async fn failed_memory_restart_keeps_saved_values_and_reports_failure() {
+        let path = std::env::temp_dir().join(format!("restart-{}.json", uuid::Uuid::new_v4()));
+        let s = Studio::new(PathBuf::new(), 8080).with_storage(path.clone());
+        let memory = metal_policy::MemorySettings {
+            automatic: false,
+            context: 4096,
+            ..Default::default()
+        };
+        let error = s.apply_memory_restart(memory.clone()).await.unwrap_err();
+        assert!(error.contains("saved") && error.contains("restart failed"));
+        assert_eq!(
+            Studio::new(PathBuf::new(), 8080)
+                .with_storage(path.clone())
+                .settings
+                .read()
+                .await
+                .metal_memory,
+            memory
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     #[tokio::test]
     async fn refuses_missing_model_config() {
         let s = Studio::new(
@@ -681,6 +993,7 @@ mod tests {
             });
             d.detached.push("api".into());
             d.generating = true;
+            d.layout.engine_width = 340;
         }
         s.persist().await.unwrap();
         let restored = Studio::new(PathBuf::new(), 8080).with_storage(path.clone());
@@ -688,6 +1001,7 @@ mod tests {
         assert_eq!(d.messages[0].content, "保存する会話");
         assert!(d.detached.is_empty());
         assert!(!d.generating);
+        assert_eq!(d.layout.engine_width, 340);
         assert_ne!(s.token, restored.token);
         std::fs::remove_file(path).unwrap();
     }

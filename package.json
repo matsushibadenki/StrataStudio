@@ -10,7 +10,11 @@
     "desktop": "tauri dev",
     "desktop:build": "tauri build --target aarch64-apple-darwin",
     "server": "cargo run -p studio-server",
-    "test:e2e": "node scripts/smoke.mjs"
+    "test:e2e": "node scripts/smoke.mjs",
+    "test:roadmap": "node scripts/roadmap-smoke.mjs",
+    "test:menus": "node scripts/menus-smoke.mjs",
+    "test:models": "node scripts/models-smoke.mjs",
+    "test:reuse": "node scripts/reuse-smoke.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
