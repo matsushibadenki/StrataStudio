@@ -97,3 +97,9 @@ Production builds use Thin LTO, one codegen unit, and stripped symbols; the desk
 For end-to-end tests, keep the Rust server and Vite running, install the Playwright Chromium runtime (`npx playwright install chromium`), then run `npm run test:e2e`. `STUDIO_TEST_PYTHON` selects the test interpreter; `PLAYWRIGHT_CHROMIUM_EXECUTABLE` can select an existing Chromium installation. Use an isolated `STUDIO_STATE_PATH` for test runs and keep the desktop app closed. `npm run test:roadmap` additionally checks preparation diagnostics, config discovery/selection, consent enforcement without downloading, tabbed preferences and workspace navigation. `npm run test:menus` checks menus, About, editing, export, shortcuts, three locales and responsive preferences. Rust tests use a fake setup script to verify completion, failure, cancellation and environment isolation without model downloads. The base test covers lifecycle, streamed GUI chat, API compatibility/authentication, three languages, and 320/375/414/768/1440px widths.
 
 See [architecture](docs/ARCHITECTURE.md) and [roadmap](docs/ROADMAP.md).
+
+Conversations are saved automatically. Use the history icon to search and resume them; New Chat preserves the previous conversation. Deletion requires confirmation, and File exports the selected conversation as JSON.
+
+Preferences → General lets you change conversation/composer text size (12–32 px) and switch between Light and Dark. These preferences are saved across restarts.
+
+Expand reasoning/tool-call sections and the metrics row below a response to inspect model output and per-request latency, reported usage and engine timings. Preferences → API lists the latest 100 finished requests (including cancellations and failures). Missing values stay unavailable; see [inference metrics](docs/INFERENCE.md).

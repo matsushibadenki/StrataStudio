@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Sun,
+  Moon,
+  History,
   Cpu,
   MessageSquare,
   Link,
@@ -23,6 +27,17 @@ import {
   Download,
   Settings as SettingsIcon,
 } from "lucide-react";
+import {
+  ConversationLibrary,
+  type ConversationIndex,
+} from "./ConversationLibrary";
+import {
+  InferenceView,
+  RequestMetrics,
+  RequestLog,
+  type Inference,
+  type Metrics,
+} from "./InferenceView";
 import { words, type Language } from "./i18n";
 import { action, connect, desktop, request, streamChat, token } from "./client";
 import "./style.css";
@@ -50,14 +65,18 @@ type Settings = {
   temperature: number;
   maxTokens: number;
   language: Language;
+  chatFontSize: number;
+  theme: "light" | "dark";
   modelDirectories: string[];
   metalMemory: MemorySettings;
 };
-type Message = { role: string; content: string };
+type Message = { role: string; content: string; inference?: Inference };
 type Snapshot = {
+  requests?: Metrics[];
   status: "offline" | "starting" | "ready";
   settings: Settings;
   document: {
+    conversations?: ConversationIndex;
     messages: Message[];
     detached: string[];
     generating: boolean;
@@ -82,11 +101,14 @@ const defaults: Settings = {
   temperature: 0.7,
   maxTokens: 512,
   language: "ja",
+  chatFontSize: 13,
+  theme: "dark",
   modelDirectories: [],
   metalMemory: defaultMemory,
 };
 const panelView = new URLSearchParams(location.search).get("panel");
 function App() {
+  const [conversationsOpen, setConversationsOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
   const [setupLocalView, setSetupLocalView] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -114,9 +136,12 @@ function App() {
   const controller = useRef<AbortController | null>(null);
   const busyRef = useRef(false);
   const initialized = useRef(false);
+  const conversationEpoch = useRef(0);
+  const conversationChanging = useRef(false);
   const draftRef = useRef(settings);
   const dirty = useRef(false);
   const scroll = useRef<HTMLDivElement>(null);
+  const followOutput = useRef(true);
   const t = words[language];
   const preparing = ["running", "cancelling"].includes(
     snapshot?.preparation?.status || "",
@@ -132,10 +157,18 @@ function App() {
         if (!initialized.current) {
           await connect();
         }
+        const epoch = conversationEpoch.current;
         const s: Snapshot = await request("/studio/state").then((r) =>
           r.json(),
         );
         if (!alive) return;
+        if (
+          conversationChanging.current ||
+          epoch !== conversationEpoch.current
+        ) {
+          timer = setTimeout(poll, 1200);
+          return;
+        }
         setSnapshot(s);
         setOnline(true);
         setConnectionFailed(false);
@@ -145,7 +178,8 @@ function App() {
           draftRef.current = s.settings;
           initialized.current = true;
         }
-        if (!busyRef.current) setMessages(s.document.messages);
+        if (!busyRef.current || s.document.generating)
+          setMessages(s.document.messages);
       } catch {
         if (alive) {
           setOnline(false);
@@ -163,8 +197,30 @@ function App() {
     };
   }, []);
   useEffect(() => {
-    scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
-  }, [messages]);
+    if (followOutput.current)
+      scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
+  }, [
+    messages.length,
+    messages.at(-1)?.content,
+    messages.at(-1)?.inference?.reasoning,
+    snapshot?.document.conversations?.activeId,
+  ]);
+  useEffect(() => {
+    document.documentElement.dataset.theme = settings.theme;
+    document.documentElement.style.setProperty(
+      "--chat-font-size",
+      `${settings.chatFontSize}px`,
+    );
+    if (desktop)
+      void getCurrentWindow().setTheme(settings.theme).catch(console.error);
+  }, [settings.theme, settings.chatFontSize]);
+  async function saveAppearance(
+    value: Partial<Pick<Settings, "theme" | "chatFontSize">>,
+  ) {
+    await action("appearance", value);
+    draftRef.current = { ...draftRef.current, ...value };
+    setSettings((current) => ({ ...current, ...value }));
+  }
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     const next = { ...draftRef.current, [key]: value };
     dirty.current = true;
@@ -243,6 +299,7 @@ function App() {
     )
       return;
     setError("");
+    followOutput.current = true;
     const next = [...messages, { role: "user", content: prompt.trim() }];
     setPrompt("");
     busyRef.current = true;
@@ -255,6 +312,7 @@ function App() {
       await persist();
       await streamChat(
         {
+          conversationId: snapshot.document.conversations?.activeId,
           model: snapshot.health?.model || "qwen3.8-flash-next",
           messages: next,
           temperature: settings.temperature,
@@ -264,16 +322,28 @@ function App() {
         c.signal,
         (delta) => {
           answer += delta;
-          setMessages([...next, { role: "assistant", content: answer }]);
+          setMessages((current) => [
+            ...next,
+            {
+              role: "assistant",
+              content: answer,
+              inference: current.at(-1)?.inference,
+            },
+          ]);
         },
       );
     } catch (e) {
       if ((e as Error).name !== "AbortError") setError((e as Error).message);
     } finally {
-      const final = answer
-        ? [...next, { role: "assistant", content: answer }]
-        : next;
-      setMessages(final);
+      try {
+        const authoritative: Snapshot = await request("/studio/state").then(
+          (r) => r.json(),
+        );
+        setSnapshot(authoritative);
+        setMessages(authoritative.document.messages);
+      } catch {
+        /* The next successful poll restores the Rust-owned response. */
+      }
       busyRef.current = false;
       setBusy(false);
       controller.current = null;
@@ -588,6 +658,7 @@ function App() {
             <Layers size={15} />
             <code>{snapshot?.health?.model || "—"}</code>
           </div>
+          <RequestLog requests={snapshot?.requests} language={language} />
         </div>
       </section>
     );
@@ -632,22 +703,45 @@ function App() {
             {t.chat}
           </h2>
           {button(
+            <History />,
+            t.conversationLibrary,
+            () => setConversationsOpen(true),
+            !online,
+          )}
+          {button(
             <Plus />,
             t.newChat,
-            () =>
-              run(async () => {
-                await action("messages", { messages: [] });
-                setMessages([]);
-              }),
-            busy || !online,
+            newChat,
+            busy || snapshot?.document.generating || pending || !online,
           )}
         </header>
-        <div className="conversation" ref={scroll}>
+        <div
+          className="conversation"
+          ref={scroll}
+          onScroll={(e) => {
+            const node = e.currentTarget;
+            followOutput.current =
+              node.scrollHeight - node.scrollTop - node.clientHeight < 72;
+          }}
+        >
           {messages.length ? (
             messages.map((m, i) => (
               <article className={"message " + m.role} key={i}>
                 <div>{m.role === "user" ? t.you : "Strata"}</div>
-                <p>{m.content || "…"}</p>
+                {m.role === "assistant" && (
+                  <InferenceView value={m.inference} language={language} />
+                )}
+                {m.content ? (
+                  <p>{m.content}</p>
+                ) : !m.inference || m.inference.metrics.status === "running" ? (
+                  <p>…</p>
+                ) : null}
+                {m.role === "assistant" && m.inference && (
+                  <RequestMetrics
+                    value={m.inference.metrics}
+                    language={language}
+                  />
+                )}
               </article>
             ))
           ) : (
@@ -786,7 +880,30 @@ function App() {
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  const newChat = () => run(() => action("messages", { messages: [] }));
+  async function conversationAction(name: string, id?: string) {
+    followOutput.current = true;
+    conversationChanging.current = true;
+    conversationEpoch.current++;
+    try {
+      await action(name, { id });
+      const next: Snapshot = await request("/studio/state").then((r) =>
+        r.json(),
+      );
+      setSnapshot(next);
+      setMessages(next.document.messages);
+      if (
+        name !== "deleteConversation" ||
+        next.document.conversations?.activeId !==
+          snapshot?.document.conversations?.activeId
+      )
+        setPrompt("");
+      setWorkspaceTab("chat");
+    } finally {
+      conversationEpoch.current++;
+      conversationChanging.current = false;
+    }
+  }
+  const newChat = () => run(() => conversationAction("newConversation"));
   const menus: AppMenu[] = [
     {
       label: "Strata Studio",
@@ -817,6 +934,11 @@ function App() {
           shortcut: "⌘N",
           action: newChat,
           disabled: !online || busy || snapshot?.document.generating,
+        },
+        {
+          label: t.conversationLibrary,
+          action: () => setConversationsOpen(true),
+          disabled: !online,
         },
         {
           label: t.exportChat,
@@ -1002,6 +1124,50 @@ function App() {
         >
           {preferenceTab === "general" ? (
             <section className="general-settings">
+              <label>{t.appearanceTheme}</label>
+              <div
+                className="appearance-options"
+                role="group"
+                aria-label={t.appearanceTheme}
+              >
+                {(["light", "dark"] as const).map((theme) => (
+                  <button
+                    key={theme}
+                    type="button"
+                    aria-pressed={settings.theme === theme}
+                    disabled={!online || pending}
+                    onClick={() => run(() => saveAppearance({ theme }))}
+                  >
+                    {theme === "light" ? <Sun size={15} /> : <Moon size={15} />}{" "}
+                    {theme === "light" ? t.lightMode : t.darkMode}
+                  </button>
+                ))}
+              </div>
+              <label className="chat-font-setting">
+                {t.chatFontSize}
+                <select
+                  aria-label={t.chatFontSize}
+                  value={settings.chatFontSize}
+                  disabled={!online || pending}
+                  onChange={(e) =>
+                    run(() =>
+                      saveAppearance({ chatFontSize: Number(e.target.value) }),
+                    )
+                  }
+                >
+                  {Array.from({ length: 21 }, (_, i) => i + 12).map((size) => (
+                    <option key={size} value={size}>
+                      {size} px
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p
+                className="appearance-preview"
+                style={{ fontSize: settings.chatFontSize }}
+              >
+                {t.fontPreview}
+              </p>
               <label>{t.language}</label>
               <nav className="language-options" aria-label={t.language}>
                 {(["ja", "en", "zh"] as const).map((l) => (
@@ -1055,6 +1221,17 @@ function App() {
             await persist();
           }}
           onClose={() => setModelsOpen(false)}
+        />
+      )}
+      {conversationsOpen && (
+        <ConversationLibrary
+          library={snapshot?.document.conversations}
+          language={language}
+          disabled={
+            busy || !!snapshot?.document.generating || pending || !online
+          }
+          onAction={conversationAction}
+          onClose={() => setConversationsOpen(false)}
         />
       )}
       {aboutOpen && (

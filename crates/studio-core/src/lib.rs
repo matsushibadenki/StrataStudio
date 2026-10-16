@@ -1,4 +1,6 @@
 pub mod catalog;
+pub mod conversations;
+pub mod inference;
 pub mod layout;
 pub mod local_model;
 pub mod memory_usage;
@@ -22,6 +24,15 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
+fn default_chat_font_size() -> u8 {
+    13
+}
+fn default_theme() -> String {
+    "dark".into()
+}
+fn valid_appearance(size: u8, theme: &str) -> bool {
+    (12..=32).contains(&size) && matches!(theme, "light" | "dark")
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -32,6 +43,10 @@ pub struct Settings {
     pub temperature: f64,
     pub max_tokens: u32,
     pub language: String,
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: u8,
+    #[serde(default = "default_theme")]
+    pub theme: String,
     #[serde(default)]
     pub model_directories: Vec<String>,
     #[serde(default)]
@@ -47,19 +62,25 @@ impl Default for Settings {
             temperature: 0.7,
             max_tokens: 512,
             language: "ja".into(),
+            chat_font_size: default_chat_font_size(),
+            theme: default_theme(),
             model_directories: Vec::new(),
             metal_memory: metal_policy::MemorySettings::default(),
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<inference::Inference>,
     pub role: String,
     pub content: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Document {
+    #[serde(default)]
+    pub conversations: conversations::Library,
     pub messages: Vec<Message>,
     pub detached: Vec<String>,
     #[serde(default)]
@@ -85,6 +106,7 @@ pub struct Studio {
     storage: Mutex<Option<PathBuf>>,
     memory_bytes: Option<u64>,
     memory_usage: Mutex<memory_usage::Monitor>,
+    requests: Mutex<VecDeque<inference::Metrics>>,
     preparation: Mutex<preparation::Preparation>,
     lifecycle: Mutex<()>,
     catalog: Mutex<Option<catalog::CachedScan>>,
@@ -137,6 +159,7 @@ impl Studio {
             lifecycle: Mutex::new(()),
             catalog: Mutex::new(None),
             memory_usage: Mutex::new(memory_usage::Monitor::default()),
+            requests: Mutex::new(VecDeque::new()),
             memory_bytes: if cfg!(target_os = "macos") {
                 std::process::Command::new("/usr/sbin/sysctl")
                     .args(["-n", "hw.memsize"])
@@ -161,6 +184,8 @@ impl Studio {
                     if doc.layout.validate().is_err() {
                         doc.layout = layout::Layout::default();
                     }
+                    inference::mark_interrupted(&mut doc.messages);
+                    doc.conversations.restore_runtime();
                     doc.generating = false;
                     doc.detached.clear(); // Native windows do not survive a process restart.
                     *self.document.get_mut() = doc;
@@ -423,6 +448,13 @@ impl Studio {
             .await
             .map_err(|e| format!("Memory settings saved, but engine restart failed: {e}"))
     }
+    async fn record_request(&self, metrics: inference::Metrics) {
+        let mut records = self.requests.lock().await;
+        if records.len() >= 100 {
+            records.pop_front();
+        }
+        records.push_back(metrics);
+    }
     pub async fn snapshot(&self) -> Value {
         let (running, upstream, key) = {
             let mut p = self.process.lock().await;
@@ -462,7 +494,19 @@ impl Studio {
             .lock()
             .await
             .snapshot(self.memory_bytes, pid);
-        json!({"memoryUsage":memory_usage,"memoryTuning":memory_tuning,"preparation":self.preparation.lock().await.snapshot(),"status":status,"health":health,"settings":*self.settings.read().await,"document":*self.document.read().await,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
+        let document = {
+            let d = self.document.read().await;
+            json!({"messages":d.messages,"detached":d.detached,"generating":d.generating,"layout":d.layout,"conversations":d.conversations.summaries(&d.messages)})
+        };
+        let requests = self
+            .requests
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        json!({"requests":requests,"memoryUsage":memory_usage,"memoryTuning":memory_tuning,"preparation":self.preparation.lock().await.snapshot(),"status":status,"health":health,"settings":*self.settings.read().await,"document":document,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
     }
 }
 fn pump<T: tokio::io::AsyncRead + Unpin + Send + 'static>(
@@ -554,9 +598,31 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
             }
         }
         "stop" => s.stop().await,
+        "appearance" => {
+            let mut settings = s.settings.write().await;
+            let size = v
+                .get("chatFontSize")
+                .map(|n| n.as_u64().filter(|n| *n <= 255).map(|n| n as u8));
+            let theme = v.get("theme").map(|n| n.as_str());
+            match (size, theme) {
+                (Some(None), _) | (_, Some(None)) => Err("Invalid appearance settings".into()),
+                _ => {
+                    let size = size.flatten().unwrap_or(settings.chat_font_size);
+                    let theme = theme.flatten().unwrap_or(&settings.theme).to_string();
+                    if valid_appearance(size, &theme) {
+                        settings.chat_font_size = size;
+                        settings.theme = theme;
+                        Ok(())
+                    } else {
+                        Err("Invalid appearance settings".into())
+                    }
+                }
+            }
+        }
         "settings" => match serde_json::from_value::<Settings>(v["settings"].clone()) {
             Ok(settings)
-                if settings.max_tokens > 0
+                if valid_appearance(settings.chat_font_size, &settings.theme)
+                    && settings.max_tokens > 0
                     && settings.max_tokens <= 262144
                     && settings.temperature.is_finite()
                     && (0.0..=2.0).contains(&settings.temperature)
@@ -596,6 +662,14 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
             }
             _ => Err("Invalid settings".into()),
         },
+        "newConversation" | "switchConversation" | "deleteConversation" => {
+            let mut d = s.document.write().await;
+            conversations::change(
+                &mut d,
+                v["action"].as_str().unwrap(),
+                v["id"].as_str().unwrap_or(""),
+            )
+        }
         "messages" => match serde_json::from_value::<Vec<Message>>(v["messages"].clone()) {
             Ok(m)
                 if m.len() <= 1000
@@ -609,6 +683,7 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
                     return error(StatusCode::CONFLICT, "Conversation is generating");
                 }
                 d.messages = m;
+                d.conversations.touch();
                 Ok(())
             }
             _ => Err("Invalid messages".into()),
@@ -673,6 +748,26 @@ async fn proxy(State(s): State<Arc<Studio>>, req: Request) -> Response {
         Ok(b) => b,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Request exceeds 16 MiB"),
     };
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut trace = ProxyTrace {
+        studio: s.clone(),
+        tracker: inference::Tracker::new(
+            if matches!(
+                path.split('?').next(),
+                Some("/v1/chat/completions" | "/v1/completions" | "/v1/messages")
+            ) {
+                "api"
+            } else {
+                "skip"
+            },
+            &model,
+        ),
+        json: false,
+        eof: false,
+    };
     let mut request = s
         .client
         .request(parts.method, format!("http://127.0.0.1:{port}{path}"))
@@ -693,15 +788,42 @@ async fn proxy(State(s): State<Arc<Studio>>, req: Request) -> Response {
     };
     let upstream = match request.send().await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_GATEWAY, e),
+        Err(e) => {
+            trace.fail();
+            return error(StatusCode::BAD_GATEWAY, e);
+        }
     };
     let status = upstream.status();
+    if !status.is_success() {
+        trace.fail();
+    }
+    trace.json = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.contains("application/json"));
     let headers = upstream.headers().clone();
     use tokio_stream::StreamExt;
-    let stream = upstream.bytes_stream().map(move |chunk| {
-        let _ = &inference;
-        chunk
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(Some)
+        .chain(tokio_stream::once(None))
+        .map(move |event| {
+            let _ = &inference;
+            match event {
+                Some(chunk) => {
+                    match &chunk {
+                        Ok(bytes) => trace.feed(bytes),
+                        Err(_) => trace.fail(),
+                    };
+                    chunk
+                }
+                None => {
+                    trace.eof = true;
+                    Ok(axum::body::Bytes::new())
+                }
+            }
+        });
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     for name in ["content-type", "cache-control"] {
@@ -710,6 +832,39 @@ async fn proxy(State(s): State<Arc<Studio>>, req: Request) -> Response {
         }
     }
     response
+}
+struct ProxyTrace {
+    studio: Arc<Studio>,
+    tracker: inference::Tracker,
+    json: bool,
+    eof: bool,
+}
+impl ProxyTrace {
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.json {
+            self.tracker.feed_json(bytes);
+        } else {
+            self.tracker.feed(bytes);
+        }
+    }
+    fn fail(&mut self) {
+        self.tracker.info.metrics.status = "error".into();
+    }
+}
+impl Drop for ProxyTrace {
+    fn drop(&mut self) {
+        // Non-inference proxy endpoints must not create misleading request rows.
+        if self.tracker.info.metrics.source == "skip" {
+            return;
+        }
+        self.tracker
+            .finish(if self.eof { "error" } else { "cancelled" }, self.json);
+        let s = self.studio.clone();
+        let metrics = self.tracker.info.metrics.clone();
+        tokio::spawn(async move {
+            s.record_request(metrics).await;
+        });
+    }
 }
 // The guard closes intervals on success, request failure and client disconnect.
 struct InferenceGuard(Arc<Studio>);
@@ -756,8 +911,18 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
         }
         (p.port, p.key.clone())
     };
+    let mut tracker = inference::Tracker::new("chat", body["model"].as_str().unwrap_or(""));
     {
         let mut d = s.document.write().await;
+        if body["conversationId"]
+            .as_str()
+            .is_some_and(|id| id != d.conversations.active_id)
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "Conversation changed; refresh before sending",
+            );
+        }
         if d.generating {
             return error(StatusCode::CONFLICT, "A conversation is already generating");
         }
@@ -765,14 +930,24 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
             return error(StatusCode::BAD_REQUEST, "Start a new conversation");
         }
         d.generating = true;
+        d.conversations.touch();
+        let mut user = user;
+        user.inference = None;
         d.messages.push(user);
-        body["messages"] = json!(d.messages);
+        body["messages"] = json!(d
+            .messages
+            .iter()
+            .filter(|m| m.role != "assistant" || !m.content.is_empty())
+            .map(|m| json!({"role":m.role,"content":m.content}))
+            .collect::<Vec<_>>());
         body["stream"] = json!(true);
         d.messages.push(Message {
             role: "assistant".into(),
             content: String::new(),
+            inference: Some(tracker.info.clone()),
         });
     }
+    body.as_object_mut().unwrap().remove("conversationId");
     let inference = InferenceGuard::new(s.clone()).await;
     drop(lifecycle);
     let response = s
@@ -788,8 +963,12 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
             {
                 let mut d = s.document.write().await;
                 d.generating = false;
-                d.messages.pop();
+                tracker.finish("error", false);
+                if let Some(last) = d.messages.last_mut() {
+                    last.inference = Some(tracker.info.clone());
+                }
             }
+            s.record_request(tracker.info.metrics.clone()).await;
             let _ = s.persist().await;
             return match other {
                 Ok(r) => {
@@ -804,38 +983,21 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
         let _inference = inference;
-        let mut buffer = Vec::<u8>::new();
+        let mut fallback = "error";
         loop {
-            let chunk = tokio::select! {_ = tx.closed()=>break,chunk=response.chunk()=>chunk};
+            let chunk = tokio::select! {_ = tx.closed()=>{fallback="cancelled";break},chunk=response.chunk()=>chunk};
             match chunk {
                 Ok(Some(bytes)) => {
-                    buffer.extend_from_slice(&bytes);
-                    while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
-                        let event = buffer.drain(..end + 2).collect::<Vec<_>>();
-                        if let Ok(text) = std::str::from_utf8(&event) {
-                            for line in text.lines() {
-                                if let Some(data) = line.strip_prefix("data:") {
-                                    if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                                        if let Some(delta) =
-                                            v["choices"][0]["delta"]["content"].as_str()
-                                        {
-                                            let mut d = s.document.write().await;
-                                            if let Some(last) = d.messages.last_mut() {
-                                                last.content.push_str(delta);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    tracker.feed(&bytes);
+                    {
+                        let mut d = s.document.write().await;
+                        if let Some(last) = d.messages.last_mut() {
+                            last.content = tracker.answer.clone();
+                            last.inference = Some(tracker.info.clone());
                         }
                     }
-                    if buffer.len() > 1024 * 1024 {
-                        let _ = tx
-                            .send(Err(std::io::Error::other("SSE event too large")))
-                            .await;
-                        break;
-                    }
                     if tx.send(Ok(bytes)).await.is_err() {
+                        fallback = "cancelled";
                         break;
                     }
                 }
@@ -846,13 +1008,17 @@ async fn chat(State(s): State<Arc<Studio>>, h: HeaderMap, Json(mut body): Json<V
                 }
             }
         }
+        tracker.finish(fallback, false);
         {
             let mut d = s.document.write().await;
             d.generating = false;
-            if d.messages.last().is_some_and(|m| m.content.is_empty()) {
-                d.messages.pop();
+            d.conversations.touch();
+            if let Some(last) = d.messages.last_mut() {
+                last.content = tracker.answer.clone();
+                last.inference = Some(tracker.info.clone());
             }
         }
+        s.record_request(tracker.info.metrics.clone()).await;
         if let Err(e) = s.persist().await {
             push_log(&s.logs, format!("[studio] Save failed: {e}")).await;
         }
@@ -920,6 +1086,61 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn request_log_is_bounded_and_contains_no_response_text() {
+        let s = Studio::new(PathBuf::new(), 8080);
+        for i in 0..101 {
+            let mut t = inference::Tracker::new("api", "test");
+            t.info.metrics.id = i.to_string();
+            s.record_request(t.info.metrics).await;
+        }
+        let log = s.requests.lock().await;
+        assert_eq!(log.len(), 100);
+        assert_eq!(log.front().unwrap().id, "1");
+        assert_eq!(log.back().unwrap().id, "100");
+        let v = serde_json::to_value(log.back()).unwrap();
+        assert!(v.get("reasoning").is_none());
+    }
+    #[tokio::test]
+    async fn appearance_changes_do_not_touch_engine_or_generation() {
+        let s = Arc::new(Studio::new(PathBuf::new(), 8080));
+        s.document.write().await.generating = true;
+        let before = s.settings.read().await.metal_memory.clone();
+        let mut h = HeaderMap::new();
+        h.insert("x-studio-token", s.token.parse().unwrap());
+        let r = action(
+            State(s.clone()),
+            h.clone(),
+            Json(json!({"action":"appearance","theme":"light","chatFontSize":24})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(s.document.read().await.generating);
+        assert_eq!(s.settings.read().await.metal_memory, before);
+        assert_eq!(s.settings.read().await.chat_font_size, 24);
+        let r = action(
+            State(s.clone()),
+            h,
+            Json(json!({"action":"appearance","theme":"invalid","chatFontSize":12})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(s.settings.read().await.chat_font_size, 24);
+    }
+    #[test]
+    fn appearance_defaults_migrate_and_validate() {
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("chatFontSize");
+        legacy.as_object_mut().unwrap().remove("theme");
+        let restored: Settings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.chat_font_size, 13);
+        assert_eq!(restored.theme, "dark");
+        assert!(valid_appearance(12, "light"));
+        assert!(valid_appearance(32, "dark"));
+        assert!(!valid_appearance(11, "light"));
+        assert!(!valid_appearance(33, "dark"));
+        assert!(!valid_appearance(16, "invalid"));
+    }
     #[tokio::test]
     async fn memory_restart_checks_before_stopping_or_saving() {
         let s = Studio::new(PathBuf::new(), 8080);
@@ -990,6 +1211,7 @@ mod tests {
             d.messages.push(Message {
                 role: "user".into(),
                 content: "保存する会話".into(),
+                inference: Some(inference::Tracker::new("chat", "test").info),
             });
             d.detached.push("api".into());
             d.generating = true;
@@ -999,6 +1221,17 @@ mod tests {
         let restored = Studio::new(PathBuf::new(), 8080).with_storage(path.clone());
         let d = restored.document.read().await;
         assert_eq!(d.messages[0].content, "保存する会話");
+        assert_eq!(
+            d.messages[0].inference.as_ref().unwrap().metrics.status,
+            "cancelled"
+        );
+        assert!(d.messages[0]
+            .inference
+            .as_ref()
+            .unwrap()
+            .metrics
+            .elapsed_ms
+            .is_none());
         assert!(d.detached.is_empty());
         assert!(!d.generating);
         assert_eq!(d.layout.engine_width, 340);

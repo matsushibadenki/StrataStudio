@@ -2,6 +2,12 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Workbench windows",
-  "windows": ["main", "panel-*"],
-  "permissions": ["core:default"]
+  "windows": [
+    "main",
+    "panel-*"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-theme"
+  ]
 }

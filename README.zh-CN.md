@@ -63,3 +63,9 @@ npm run desktop:build -- --bundles app --no-sign
 Release构建面向Apple Silicon。发布签名与公证需要Apple开发者凭据。
 
 更多内容见[English README](README.md)、[架构](docs/ARCHITECTURE.md)和[路线图](docs/ROADMAP.md)。
+
+对话自动保存。点击历史图标可搜索并继续对话；新建对话会保留原对话。删除前需确认，可通过文件菜单将当前对话导出为JSON。
+
+偏好设置 → 通用中可设置对话及输入框的文字大小（12–32px），并切换浅色或深色模式。设置会自动保存，重启后保留。
+
+展开回答的推理/工具调用及计量行，可查看推理文本、工具参数、单次请求延迟和上游报告的token数及速度。偏好设置 → API显示最近100条请求的计量；缺失值显示—。参见[推理与计量](docs/INFERENCE.md)。

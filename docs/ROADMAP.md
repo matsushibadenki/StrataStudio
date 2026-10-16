@@ -22,10 +22,10 @@
 - 🟢 [Done] Engine Start/Stop controls moved above memory settings into a pinned toolbar; edit/apply/start/stop works without scrolling, verified in three languages at 1440, 390 and 320 px widths.
 - 🟢 [Done] Apply & restart edits memory settings while running and performs validated stop/save/start in Rust; preparation/generation guards, failure reporting, 29 core tests and three-language one-action restart checks.
 - 🟢 [Done] Live Mac system memory usage/availability with cached native Mach sampling, automatic before-change reference and deltas; missing readings stay unavailable, 32 core tests and three-language live/resize checks.
-- 🟠 [Next] Additional model families and runtime-specific import paths beyond the current Metal setup allowlist.
-- 🔴 [Later] Multi-conversation library and history navigation.
-- 🔴 [Later] Advanced panel reordering and floating tab groups.
-- 🔴 [Later] Reasoning/tool-call presentation and measured telemetry views.
+- ⭕️ [Pending] Additional model families beyond the current Metal setup allowlist: the checked-in Mac setup supports only Qwen3.8-Flash-Next GSQ-RCO/Unsloth variants; requires a compatible runtime and real model validation. Existing ready configs remain reusable.
+- 🟢 [Done] Rust-owned multi-conversation library: non-destructive New Chat, automatic titles, search, resume, confirmed deletion, legacy migration and persistent history; summary-only snapshots, generation guards and stale-window conversation checks; 38 core tests, three-language responsive interaction checks, restart restoration and native legacy-conversation verification.
+- 🟠 [Next] Advanced panel reordering and floating tab groups, preserving shared Rust state.
+- 🟢 [Done] Reasoning/tool-call presentation and per-request telemetry: separate reasoning/answer/tool data, response-reported usage and engine timings, gateway latency, completed/cancelled/error states, saved conversation metrics and a bounded 100-request chat/API log. 45 core tests, three-language responsive checks, restart restoration and real Q2_0 measurements verified; see [inference metrics](INFERENCE.md).
 - 🔴 [Later] Rust/wgpu rendering for any future heavy GPU visualization; frame data retained natively.
 - ⭕️ [Pending] Extended Metal memory-pressure, long-context, accuracy and SSD-streaming benchmarks; real inference checks so far use short requests on this development Mac.
 - ⭕️ [Pending] Real-hardware validation of automatic profiles on Macs other than the 32 GiB M4; capacity boundaries are covered by automated tests.
@@ -34,3 +34,5 @@
 - 🟢 [Done] エンジンタブにStrataプロセスのphysical footprint、設定適用前の値、再起動後の増減を表示。停止・取得不可は「—」。
 
 - 🟢 [Done] Mac全体・Strata単体のメモリ履歴グラフ（直近10分、2/5/10分切替、ホバー、設定・起動停止・推論イベント）。Rust共有Stateでチャット表示中も記録。
+
+- 🟢 [Done] General preferences persist conversation/composer text size (12–32 px) and light/dark appearance, with live preview, shared Rust settings, old-state defaults and native window theme integration; 40 core tests, three-language responsive checks and native restart persistence verified.
