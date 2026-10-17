@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
 import {
   Sun,
   Moon,
@@ -42,7 +43,14 @@ import { words, type Language } from "./i18n";
 import { action, connect, desktop, request, streamChat, token } from "./client";
 import "./style.css";
 import { SetupDialog, type Inspection, type Preparation } from "./SetupDialog";
-import type { Layout } from "./ResizeHandle";
+import { defaultLayout, type Layout } from "./ResizeHandle";
+import type { WorkspaceTab } from "./WorkspaceTabs";
+import {
+  WorkspaceDock,
+  defaultGroups,
+  type WorkspaceGroup,
+  type DockPlacement,
+} from "./WorkspaceDock";
 import { AppMenus, type AppMenu } from "./AppMenus";
 import {
   Modal,
@@ -73,6 +81,7 @@ type Settings = {
 type Message = { role: string; content: string; inference?: Inference };
 type Snapshot = {
   requests?: Metrics[];
+  dockingDiagnostics?: { enabled: boolean };
   status: "offline" | "starting" | "ready";
   settings: Settings;
   document: {
@@ -81,6 +90,8 @@ type Snapshot = {
     detached: string[];
     generating: boolean;
     layout: Layout;
+    workspaceGroups: WorkspaceGroup[];
+    workspaceHosts: Record<string, string>;
   };
   preparation: Preparation;
   logs: string[];
@@ -116,7 +127,7 @@ function App() {
   const [preferencesOpen, setPreferencesOpen] = useState(false);
   const [preferenceTab, setPreferenceTab] = useState<PreferenceTab>("general");
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [workspaceTab, setWorkspaceTab] = useState<"chat" | "logs">("chat");
+
   const editor = useRef<{
     element: HTMLInputElement | HTMLTextAreaElement;
     start: number | null;
@@ -143,9 +154,136 @@ function App() {
   const scroll = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
   const t = words[language];
+  const layout = snapshot?.document.layout || defaultLayout;
+  const workspaceTab = layout.workspaceActive;
+  const groups = snapshot?.document.workspaceGroups || defaultGroups;
+  const workspaceWindow =
+    panelView === "workspace" ||
+    panelView === "group-chat" ||
+    panelView === "group-logs";
+  const windowGroup = workspaceWindow ? panelView : null;
+  const selectedGroup =
+    groups.find((group) => group.tabs.includes(workspaceTab)) || groups[0];
+  const hosts = snapshot?.document.workspaceHosts || {};
+  const hostedGroups = groups.filter(
+    (group) => hosts[group.id] === windowGroup,
+  );
+  const currentGroup = windowGroup
+    ? (
+        hostedGroups.find((group) => group.tabs.includes(workspaceTab)) ||
+        hostedGroups[0] ||
+        selectedGroup
+      ).id
+    : selectedGroup.id;
+  const detached = snapshot?.document.detached || [];
+  const groupDetached = detached.includes(currentGroup);
+  const structureDisabled =
+    !online ||
+    pending ||
+    (!desktop &&
+      detached.some((id) => id === "workspace" || id.startsWith("group-")));
+  function setWorkspaceTab(tab: WorkspaceTab) {
+    void run(async () => {
+      await action("workspaceTab", { tab });
+      if (desktop) {
+        const target = groups.find((group) => group.tabs.includes(tab));
+        if (
+          target &&
+          ((windowGroup && hosts[target.id] !== windowGroup) ||
+            detached.includes(target.id))
+        )
+          await invoke("focus_workspace_tab", { tab });
+      }
+    }, true);
+  }
+  function moveWorkspaceTab(tab: WorkspaceTab, before: WorkspaceTab) {
+    void run(() => action("moveWorkspaceTab", { tab, before }));
+  }
+  async function dockWorkspace(group = currentGroup) {
+    await run(() => invoke("dock_panel", { panel: group }));
+  }
+  function dockWorkspaceTab(
+    tab: WorkspaceTab,
+    target: WorkspaceTab,
+    placement: DockPlacement,
+  ) {
+    void run(() =>
+      desktop
+        ? invoke("dock_workspace_tab", { tab, target, placement })
+        : action("dockWorkspaceTab", { tab, target, placement }),
+    );
+  }
   const preparing = ["running", "cancelling"].includes(
     snapshot?.preparation?.status || "",
   );
+  useEffect(() => {
+    if (!desktop || !snapshot?.dockingDiagnostics?.enabled) return;
+    let lastMove = 0;
+    function trace(event: Event) {
+      const e = event as MouseEvent & DragEvent;
+      if (e.type === "pointermove" && !e.buttons) return;
+      const time = Date.now();
+      if (["pointermove", "dragover"].includes(e.type)) {
+        if (time - lastMove < 100) return;
+        lastMove = time;
+      }
+      const element = e.target instanceof Element ? e.target : null;
+      void invoke("trace_workspace_drag", {
+        event: {
+          phase: e.type,
+          trusted: e.isTrusted,
+          bubbles: e.bubbles,
+          x: e.clientX,
+          y: e.clientY,
+          sx: e.screenX,
+          sy: e.screenY,
+          buttons: e.buttons,
+          button: e.button,
+          types: Array.from(e.dataTransfer?.types || []),
+          tab: element?.closest('[role="tab"]')?.id,
+          target: element?.closest(".dock-target")?.className,
+          group: element?.closest("[data-group]")?.getAttribute("data-group"),
+          element:
+            element?.tagName + "." + (element?.getAttribute("class") || ""),
+          wx: window.screenX,
+          wy: window.screenY,
+          width: innerWidth,
+          height: innerHeight,
+          time,
+        },
+      }).catch(() => {});
+    }
+    const events = [
+      "pointerdown",
+      "pointermove",
+      "pointerup",
+      "dragstart",
+      "dragenter",
+      "dragover",
+      "dragleave",
+      "drop",
+      "dragend",
+    ];
+    events.forEach((name) => document.addEventListener(name, trace, true));
+    return () =>
+      events.forEach((name) => document.removeEventListener(name, trace, true));
+  }, [snapshot?.dockingDiagnostics?.enabled]);
+  useEffect(() => {
+    if (!desktop) return;
+    const unlisten = listen("workspace-cancel-generation", () =>
+      controller.current?.abort(),
+    );
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+  function cancelGeneration() {
+    if (controller.current) controller.current.abort();
+    else if (desktop)
+      void emit("workspace-cancel-generation").catch((e) =>
+        setError(String(e)),
+      );
+  }
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : language;
   }, [language]);
@@ -231,9 +369,9 @@ function App() {
     await action("settings", { settings: draftRef.current });
     dirty.current = false;
   }
-  async function run(fn: () => Promise<unknown>) {
+  async function run(fn: () => Promise<unknown>, quiet = false) {
     setError("");
-    setPending(true);
+    if (!quiet) setPending(true);
     try {
       await fn();
       const s = await request("/studio/state").then((r) => r.json());
@@ -241,7 +379,7 @@ function App() {
     } catch (e) {
       setError(String((e as Error).message));
     } finally {
-      setPending(false);
+      if (!quiet) setPending(false);
     }
   }
   async function changeLanguage(l: Language) {
@@ -386,6 +524,7 @@ function App() {
         <div className="tools">
           {extra}
           {panelView &&
+            !workspaceWindow &&
             button(
               panelView ? <PanelLeftClose /> : <ExternalLink />,
               panelView ? t.dock : t.float,
@@ -774,13 +913,13 @@ function App() {
               }
             }}
           />
-          {busy ? (
+          {busy || snapshot?.document.generating ? (
             <button
               type="button"
               className="primary"
               aria-label={t.cancel}
               title={t.cancel}
-              onClick={() => controller.current?.abort()}
+              onClick={cancelGeneration}
             >
               <Square />
             </button>
@@ -830,7 +969,7 @@ function App() {
     }
   }
   async function edit(command: string) {
-    if (workspaceTab === "logs") {
+    if (workspaceTab === "logs" && (!panelView || workspaceWindow)) {
       if (command === "selectAll") {
         const log = document.querySelector(".log-lines");
         if (log) {
@@ -1005,6 +1144,29 @@ function App() {
           selected: workspaceTab === "logs",
           action: () => setWorkspaceTab("logs"),
         },
+        {
+          label:
+            groupDetached && !workspaceWindow
+              ? t.dockGroup
+              : workspaceWindow
+                ? t.dockGroup
+                : t.floatGroup,
+          disabled: !desktop || pending || !online,
+          action: () =>
+            groupDetached || workspaceWindow
+              ? dockWorkspace()
+              : float(currentGroup),
+          separator: true,
+        },
+        {
+          label: t.resetWorkspace,
+          disabled:
+            structureDisabled ||
+            detached.some(
+              (id) => id === "workspace" || id.startsWith("group-"),
+            ),
+          action: () => run(() => action("resetWorkspace")),
+        },
       ],
     },
     {
@@ -1052,7 +1214,7 @@ function App() {
           {button(<Square />, t.clear, () => setError(""))}
         </div>
       ) : null}
-      {panelView ? (
+      {panelView && !workspaceWindow ? (
         <main className="floating-main">
           {panelView === "engine"
             ? engine()
@@ -1061,57 +1223,28 @@ function App() {
               : logs()}
         </main>
       ) : (
-        <main className="workspace">
-          <div
-            className="workspace-content"
-            role="tabpanel"
-            id="workspace-content"
-            aria-labelledby={"workspace-" + workspaceTab}
-          >
-            <div hidden={workspaceTab !== "chat"} className="workspace-page">
-              {chat()}
-            </div>
-            <div hidden={workspaceTab !== "logs"} className="workspace-page">
-              {logs()}
-            </div>
-          </div>
-          <div
-            className="workspace-tabs"
-            role="tablist"
-            aria-label={t.workspaceTabs}
-          >
-            {(["chat", "logs"] as const).map((id) => (
-              <button
-                key={id}
-                role="tab"
-                id={"workspace-" + id}
-                aria-selected={workspaceTab === id}
-                aria-controls="workspace-content"
-                tabIndex={workspaceTab === id ? 0 : -1}
-                onClick={() => setWorkspaceTab(id)}
-                onKeyDown={(e) => {
-                  if (
-                    ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)
-                  ) {
-                    e.preventDefault();
-                    const next =
-                      e.key === "Home"
-                        ? "chat"
-                        : e.key === "End"
-                          ? "logs"
-                          : id === "chat"
-                            ? "logs"
-                            : "chat";
-                    setWorkspaceTab(next);
-                    document.getElementById("workspace-" + next)?.focus();
-                  }
-                }}
-              >
-                {id === "chat" ? <MessageSquare /> : <FileText />}
-                {t[id]}
-              </button>
-            ))}
-          </div>
+        <main className="workspace-host">
+          <WorkspaceDock
+            groups={groups}
+            trace={snapshot?.dockingDiagnostics?.enabled}
+            layout={layout}
+            detached={detached}
+            hosts={hosts}
+            windowGroup={windowGroup}
+            language={language}
+            native={desktop}
+            disabled={!online || pending}
+            structureDisabled={structureDisabled}
+            onSelect={setWorkspaceTab}
+            onMove={moveWorkspaceTab}
+            onFloat={(group) => float(group)}
+            onDockWindow={(group) => dockWorkspace(group)}
+            onDockTab={dockWorkspaceTab}
+            onResize={(ratio) =>
+              run(() => action("resizeWorkspace", { ratio }))
+            }
+            render={(tab) => (tab === "chat" ? chat() : logs())}
+          />
         </main>
       )}
       {preferencesOpen && (

@@ -62,7 +62,7 @@ export const words = {
 
     memoryEngine: "Strata engine",
     memoryEngineHelp:
-      "Physical footprint of the Strata engine process, including memory charged by macOS such as Metal allocations. Excludes the Studio GUI and child processes. Not model file size; shared memory and caches differ from system-wide accounting. Stopped, mock or unavailable: —. The reference is captured before applying settings and survives engine restart.",
+      "Sum of physical footprints for the Strata server and its native engine process group, including memory charged by macOS such as Metal allocations. Excludes the Studio GUI. Shared allocations may be charged to multiple processes. Not model file size; shared memory and caches differ from system-wide accounting. Stopped, mock or unavailable: —. The reference is captured before applying settings and survives engine restart.",
     memoryLive: "Mac memory · live",
     memoryUsed: "Used",
     memoryAvailable: "Available",
@@ -143,6 +143,24 @@ export const words = {
     version: "Version",
     desktopOnly: "Available in the desktop app",
     workspaceTabs: "Workspace",
+    reorderTabs: "Drag to reorder · Alt+←/→",
+    moveTabLeft: "Move tab left",
+    moveTabRight: "Move tab right",
+    floatGroup: "Float tab group",
+    dockGroup: "Dock tab group",
+    workspaceFloating: "Workspace in another window",
+    showGroup: "Show window",
+    resetWorkspace: "Reset workspace layout",
+    dockLayout: "Dock layout",
+    resizeGroups: "Resize workspace groups",
+    dockPositions: {
+      left: "Dock left",
+      right: "Dock right",
+      top: "Dock above",
+      bottom: "Dock below",
+      center: "Merge into tab group",
+    },
+
     aboutDescription: "Local inference on Apple Silicon.",
     save: "Save",
 
@@ -283,7 +301,7 @@ export const words = {
 
     memoryEngine: "Strataエンジン",
     memoryEngineHelp:
-      "StrataエンジンのプロセスにmacOSが計上する物理メモリ使用量（physical footprint）です。Metalの割り当てなどを含みます。Studio画面・子プロセスは含みません。モデルファイルのサイズとは異なり、共有メモリやキャッシュの集計もMac全体の値と異なります。停止中・テストエンジン・取得不可は「—」。設定適用直前の値を再起動後も比較できます。",
+      "Strataサーバーと同じプロセスグループで動くエンジン本体の物理メモリ使用量（physical footprint）の合計です。macOSが計上するMetalの割り当てなどを含み、Studio画面は含みません。共有領域は複数プロセスに計上される場合があります。モデルファイルのサイズとは異なり、共有メモリやキャッシュの集計もMac全体の値と異なります。停止中・テストエンジン・取得不可は「—」。設定適用直前の値を再起動後も比較できます。",
     memoryLive: "Macのメモリ · リアルタイム",
     memoryUsed: "使用中",
     memoryAvailable: "空き（利用可能）",
@@ -364,6 +382,24 @@ export const words = {
     version: "バージョン",
     desktopOnly: "デスクトップアプリで使用できます",
     workspaceTabs: "ワークスペース",
+    reorderTabs: "ドラッグで並べ替え · Alt+←/→",
+    moveTabLeft: "タブを左へ移動",
+    moveTabRight: "タブを右へ移動",
+    floatGroup: "タブグループを切り離す",
+    dockGroup: "タブグループを戻す",
+    workspaceFloating: "ワークスペースは別ウインドウに表示中",
+    showGroup: "ウインドウを表示",
+    resetWorkspace: "ワークスペース配置をリセット",
+    dockLayout: "ドッキング配置",
+    resizeGroups: "グループの境界を調整",
+    dockPositions: {
+      left: "左にドッキング",
+      right: "右にドッキング",
+      top: "上にドッキング",
+      bottom: "下にドッキング",
+      center: "タブグループに結合",
+    },
+
     aboutDescription: "Apple Siliconで動くローカル推論。",
     save: "保存",
 
@@ -503,7 +539,7 @@ export const words = {
 
     memoryEngine: "Strata引擎",
     memoryEngineHelp:
-      "Strata引擎进程的物理内存占用（physical footprint），包含macOS计入该进程的Metal等分配。不含Studio界面和子进程，并非模型文件大小。共享内存及缓存的统计口径与系统整体不同。停止、测试引擎或无法获取时显示—。应用设置前记录基准，重启后仍可比较。",
+      "Strata服务器及同一进程组内原生引擎的物理内存占用（physical footprint）之和，包含macOS计入的Metal等分配。不含Studio界面；共享分配可能在多个进程中重复计入。并非模型文件大小。共享内存及缓存的统计口径与系统整体不同。停止、测试引擎或无法获取时显示—。应用设置前记录基准，重启后仍可比较。",
     memoryLive: "Mac内存 · 实时",
     memoryUsed: "已使用",
     memoryAvailable: "可用内存",
@@ -583,6 +619,24 @@ export const words = {
     version: "版本",
     desktopOnly: "仅限桌面应用",
     workspaceTabs: "工作区",
+    reorderTabs: "拖动以排序 · Alt+←/→",
+    moveTabLeft: "向左移动标签页",
+    moveTabRight: "向右移动标签页",
+    floatGroup: "浮动标签页组",
+    dockGroup: "停靠标签页组",
+    workspaceFloating: "工作区已在另一个窗口中打开",
+    showGroup: "显示窗口",
+    resetWorkspace: "重置工作区布局",
+    dockLayout: "停靠布局",
+    resizeGroups: "调整组大小",
+    dockPositions: {
+      left: "停靠到左侧",
+      right: "停靠到右侧",
+      top: "停靠到上方",
+      bottom: "停靠到下方",
+      center: "合并为标签页组",
+    },
+
     aboutDescription: "在 Apple Silicon 上运行本地推理。",
     save: "保存",
 

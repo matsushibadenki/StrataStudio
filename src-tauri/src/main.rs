@@ -4,6 +4,7 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 struct Runtime {
     studio: Arc<studio_core::Studio>,
+    panels: tokio::sync::Mutex<()>,
     shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 #[tauri::command]
@@ -11,16 +12,46 @@ fn connection(runtime: State<Runtime>) -> serde_json::Value {
     serde_json::json!({"url":format!("http://127.0.0.1:{}",runtime.studio.port),"token":runtime.studio.token})
 }
 #[tauri::command]
+async fn trace_workspace_drag(
+    window: tauri::WebviewWindow,
+    runtime: State<'_, Runtime>,
+    event: serde_json::Value,
+) -> Result<(), String> {
+    runtime
+        .studio
+        .docking_diagnostics
+        .lock()
+        .await
+        .record(window.label(), event);
+    Ok(())
+}
+#[tauri::command]
 async fn float_panel(
     app: tauri::AppHandle,
     runtime: State<'_, Runtime>,
     panel: String,
 ) -> Result<(), String> {
-    if !["engine", "api", "logs"].contains(&panel.as_str()) {
-        return Err("Unknown panel".into());
+    let _guard = runtime.panels.lock().await;
+    let mut document = runtime.studio.document.write().await;
+    if !["engine", "api", "logs"].contains(&panel.as_str()) && !document.layout.is_group(&panel) {
+        return Err("Unknown or stale panel group".into());
+    }
+    let workspace = document.layout.is_group(&panel);
+    let host = document.host_for(&panel).to_string();
+    if workspace && host != "main" {
+        if let Some(w) = app.get_webview_window(&format!("panel-{host}")) {
+            w.show().map_err(|e| e.to_string())?;
+            w.set_focus().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        document.release_host(&host);
     }
     let label = format!("panel-{panel}");
     if let Some(w) = app.get_webview_window(&label) {
+        if workspace {
+            document.float_group(&panel, &panel)?;
+        }
+        w.show().map_err(|e| e.to_string())?;
         w.set_focus().map_err(|e| e.to_string())?;
         return Ok(());
     }
@@ -30,29 +61,47 @@ async fn float_panel(
         tauri::WebviewUrl::App(format!("index.html?panel={panel}").into()),
     )
     .title(format!("Strata · {panel}"))
-    .inner_size(if panel == "logs" { 780.0 } else { 380.0 }, 520.0)
+    .inner_size(
+        if workspace || panel == "logs" {
+            900.0
+        } else {
+            380.0
+        },
+        640.0,
+    )
     .min_inner_size(320.0, 320.0)
+    .disable_drag_drop_handler()
     .build()
     .map_err(|e| e.to_string())?;
-    runtime
-        .studio
-        .document
-        .write()
-        .await
-        .detached
-        .push(panel.clone());
+    if workspace {
+        document.float_group(&panel, &panel)?;
+    } else {
+        document.detached.retain(|id| id != &panel);
+        document.detached.push(panel.clone());
+    }
+    drop(document);
     let studio = runtime.studio.clone();
+    let handle = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
             let studio = studio.clone();
             let panel = panel.clone();
+            let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                studio
-                    .document
-                    .write()
-                    .await
-                    .detached
-                    .retain(|p| p != &panel);
+                let runtime = handle.state::<Runtime>();
+                let _guard = runtime.panels.lock().await;
+                if handle
+                    .get_webview_window(&format!("panel-{panel}"))
+                    .is_some()
+                {
+                    return;
+                }
+                let mut document = studio.document.write().await;
+                if studio_core::docking::workspace_host(&panel) {
+                    document.release_host(&panel);
+                } else {
+                    document.detached.retain(|p| p != &panel);
+                }
             });
         }
     });
@@ -64,17 +113,136 @@ async fn dock_panel(
     runtime: State<'_, Runtime>,
     panel: String,
 ) -> Result<(), String> {
-    runtime
-        .studio
-        .document
-        .write()
-        .await
-        .detached
-        .retain(|p| p != &panel);
-    if let Some(w) = app.get_webview_window(&format!("panel-{panel}")) {
-        w.close().map_err(|e| e.to_string())?;
+    let _guard = runtime.panels.lock().await;
+    if ![
+        "engine",
+        "api",
+        "logs",
+        "workspace",
+        "group-chat",
+        "group-logs",
+    ]
+    .contains(&panel.as_str())
+    {
+        return Err("Unknown panel".into());
+    }
+    if studio_core::docking::workspace_host(&panel) {
+        let retired = runtime.studio.document.write().await.return_group(&panel);
+        if let Some(host) = retired {
+            retire_workspace_hosts(&app, runtime.studio.clone(), vec![host]).await?;
+        }
+    } else {
+        if let Some(w) = app.get_webview_window(&format!("panel-{panel}")) {
+            w.close().map_err(|e| e.to_string())?;
+        }
+        runtime
+            .studio
+            .document
+            .write()
+            .await
+            .detached
+            .retain(|p| p != &panel);
     }
     Ok(())
+}
+/// Keep a generating source WebView alive but hidden until its stream finishes.
+async fn retire_workspace_hosts(
+    app: &tauri::AppHandle,
+    studio: Arc<studio_core::Studio>,
+    hosts: Vec<String>,
+) -> Result<(), String> {
+    for host in hosts {
+        let document = studio.document.read().await;
+        if document.workspace_hosts.values().any(|id| id == &host) {
+            continue;
+        }
+        let generating = document.generating;
+        drop(document);
+        if let Some(window) = app.get_webview_window(&format!("panel-{host}")) {
+            if !generating {
+                window.close().map_err(|e| e.to_string())?;
+                continue;
+            }
+            window.hide().map_err(|e| e.to_string())?;
+            let handle = app.clone();
+            let studio = studio.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let runtime = handle.state::<Runtime>();
+                    let _guard = runtime.panels.lock().await;
+                    let document = studio.document.read().await;
+                    if document.workspace_hosts.values().any(|id| id == &host) {
+                        return;
+                    }
+                    if document.generating {
+                        continue;
+                    }
+                    drop(document);
+                    if let Some(w) = handle.get_webview_window(&format!("panel-{host}")) {
+                        let _ = w.close();
+                    }
+                    return;
+                }
+            });
+        }
+    }
+    Ok(())
+}
+#[tauri::command]
+async fn dock_workspace_tab(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+    tab: String,
+    target: String,
+    placement: String,
+) -> Result<(), String> {
+    let _guard = runtime.panels.lock().await;
+    let destination = if window.label() == "main" {
+        "main"
+    } else {
+        window
+            .label()
+            .strip_prefix("panel-")
+            .ok_or("Invalid workspace window")?
+    };
+    let retired = runtime.studio.document.write().await.dock_workspace(
+        &tab,
+        &target,
+        &placement,
+        destination,
+    )?;
+    // Reconcile windows even if writing settings fails: the in-memory document is authoritative.
+    let saved = runtime.studio.persist().await;
+    retire_workspace_hosts(&app, runtime.studio.clone(), retired).await?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    saved
+}
+#[tauri::command]
+async fn focus_workspace_tab(
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+    tab: String,
+) -> Result<(), String> {
+    let document = runtime.studio.document.read().await;
+    let group = document
+        .layout
+        .groups()
+        .into_iter()
+        .find(|g| g.tabs.contains(&tab))
+        .ok_or("Unknown workspace tab")?;
+    let host = document.host_for(&group.id);
+    let label = if host != "main" {
+        format!("panel-{host}")
+    } else {
+        "main".into()
+    };
+    drop(document);
+    app.get_webview_window(&label)
+        .ok_or("Workspace window not found")?
+        .set_focus()
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 async fn select_path(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
@@ -161,6 +329,7 @@ fn main() {
             });
             app.manage(Runtime {
                 studio,
+                panels: tokio::sync::Mutex::new(()),
                 shutdown: std::sync::Mutex::new(Some(tx)),
             });
             Ok(())
@@ -171,7 +340,10 @@ fn main() {
             export_conversation,
             select_path,
             float_panel,
-            dock_panel
+            dock_panel,
+            focus_workspace_tab,
+            dock_workspace_tab,
+            trace_workspace_drag
         ])
         .build(tauri::generate_context!())
         .expect("Cannot start Strata Studio")

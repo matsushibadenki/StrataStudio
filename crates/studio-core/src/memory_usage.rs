@@ -87,28 +87,70 @@ pub fn read(total: Option<u64>) -> Option<Sample> {
     }
 }
 
-/// Physical footprint of the owned engine process (not the Studio GUI or model files).
+/// Summed physical footprints in the owned engine process group (not the Studio GUI).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSample {
     pub sampled_at: u64,
     pub pid: u32,
     pub used_bytes: u64,
+    pub process_count: u32,
+    pub root_bytes: u64,
 }
 pub fn read_engine(pid: Option<u32>) -> Option<EngineSample> {
     #[cfg(target_os = "macos")]
     {
         let pid = pid.filter(|p| *p > 0 && *p <= i32::MAX as u32)?;
-        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-        let status = unsafe {
-            libc::proc_pid_rusage(
-                pid as i32,
-                libc::RUSAGE_INFO_V2,
-                &mut info as *mut _ as *mut libc::rusage_info_t,
-            )
-        };
-        if status != 0 {
-            return None;
+        fn footprint(pid: i32) -> Option<u64> {
+            let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                libc::proc_pid_rusage(
+                    pid,
+                    libc::RUSAGE_INFO_V2,
+                    &mut info as *mut _ as *mut libc::rusage_info_t,
+                )
+            };
+            (status == 0).then_some(info.ri_phys_footprint)
+        }
+        let root = pid as i32;
+        let root_bytes = footprint(root)?;
+        let mut used_bytes = root_bytes;
+        let mut process_count = 1;
+        // Studio starts the Python server in its own process group. Its native
+        // Metal child inherits that group; counting just Python misses the model.
+        if unsafe { libc::getpgid(root) } == root {
+            let mut members = [0i32; 256];
+            // PROC_PGRP_ONLY from the macOS SDK sys/proc_info.h; returns bytes.
+            let bytes = unsafe {
+                libc::proc_listpids(
+                    2,
+                    pid,
+                    members.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&members) as i32,
+                )
+            };
+            if bytes <= 0 || bytes as usize >= std::mem::size_of_val(&members) {
+                return None; // Do not present an incomplete group as a full total.
+            }
+            let count = bytes as usize / std::mem::size_of::<i32>();
+            for child in members[..count]
+                .iter()
+                .copied()
+                .filter(|&p| p > 0 && p != root)
+            {
+                if unsafe { libc::getpgid(child) } != root {
+                    continue;
+                }
+                if let Some(used) = footprint(child) {
+                    used_bytes = used_bytes.saturating_add(used);
+                    process_count += 1;
+                } else if unsafe { libc::getpgid(child) } == root {
+                    return None;
+                }
+            }
+            if unsafe { libc::getpgid(root) } != root {
+                return None;
+            }
         }
         Some(EngineSample {
             sampled_at: SystemTime::now()
@@ -116,7 +158,9 @@ pub fn read_engine(pid: Option<u32>) -> Option<EngineSample> {
                 .unwrap_or_default()
                 .as_millis() as u64,
             pid,
-            used_bytes: info.ri_phys_footprint,
+            used_bytes,
+            process_count,
+            root_bytes,
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -283,6 +327,50 @@ mod tests {
         );
         assert!(read_engine(Some(u32::MAX)).is_none());
         assert!(read_engine(None).is_none());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn engine_sample_includes_native_children_but_not_other_groups() {
+        use std::os::unix::process::CommandExt;
+        struct Group(std::process::Child);
+        impl Drop for Group {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let owned = Group(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30 & wait"])
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let unrelated = Group(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let sample = loop {
+            if let Some(sample) = read_engine(Some(owned.0.id())) {
+                if sample.process_count == 2 {
+                    break sample;
+                }
+            }
+            assert!(Instant::now() < deadline, "native child was not counted");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(sample.used_bytes > sample.root_bytes);
+        assert_eq!(sample.pid, owned.0.id());
+        assert_eq!(
+            read_engine(Some(unrelated.0.id())).unwrap().process_count,
+            1
+        );
     }
     #[test]
     fn history_is_bounded_and_keeps_missing_engine_as_a_gap() {

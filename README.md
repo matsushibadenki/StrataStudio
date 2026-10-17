@@ -36,7 +36,7 @@ On Apple Silicon, Studio automatically caps context and prompt buffers by physic
 
 The logo opens About, Preferences and Quit. File/Edit/View/Help menus provide conversation export, text editing and workspace switching. Preferences has **General** (language), **Engine**, and **API** tabs. Switch the main workspace using the **Chat / Logs** tabs at the bottom. `⌘,` opens Preferences; `⌘N` starts a new conversation; `⌘1` / `⌘2` switch the workspace. File → Export conversation saves JSON through a native save dialog (browser builds download JSON).
 
-Configuration, conversation, and in-flight generated text belong to Rust. Configuration and conversation survive restart; selected UI tabs and the unsent composer are temporary interaction state. Path fields retain their native file/folder pickers.
+Configuration, conversation, and in-flight generated text belong to Rust. Configuration, conversation, workspace tab order and selection survive restart; the unsent composer is temporary interaction state. Path fields retain their native file/folder pickers.
 
 ## Local model discovery
 
@@ -103,3 +103,11 @@ Conversations are saved automatically. Use the history icon to search and resume
 Preferences → General lets you change conversation/composer text size (12–32 px) and switch between Light and Dark. These preferences are saved across restarts.
 
 Expand reasoning/tool-call sections and the metrics row below a response to inspect model output and per-request latency, reported usage and engine timings. Preferences → API lists the latest 100 finished requests (including cancellations and failures). Missing values stay unavailable; see [inference metrics](docs/INFERENCE.md).
+
+Workspace tabs support drag reordering, arrow buttons and Alt+Left/Right. Float the Chat/Logs group with the outward-arrow icon; dock it with the return icon or close the floating window. Both windows share Rust state. See [workspace controls](docs/WORKSPACE.md).
+
+The dock-layout icon splits Chat and Logs left/right or above/below, or merges them back into one tab group. Drag tabs onto edge/center targets for the same actions, resize the boundary, and float either group independently. Split geometry survives restart; narrow windows stack the groups. Floating tabs can dock directly into the main workspace or another floating window. Drop onto an edge to split or the center to merge; the destination stays open and empty source windows close automatically.
+
+## Inference measurements
+
+With an existing model configured, run `npm run benchmark:inference -- --start --output /tmp/strata-benchmark.json`. This opt-in loopback test uses synthetic retrieval prompts of increasing length, records engine-reported tokens/timings and sampled Mac/engine memory, and stops an engine it started. It does not download models or change conversations/settings. See [measurement procedure and limits](docs/BENCHMARKS.md).

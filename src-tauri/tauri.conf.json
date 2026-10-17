@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "dragDropEnabled": false,
         "title": "Strata Studio",
         "width": 1440,
         "height": 960,

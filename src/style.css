@@ -2072,3 +2072,274 @@ button:focus-visible {
 .request-metrics dl {
   max-width: 620px;
 }
+
+/* One Rust-owned tab group can move between native windows. */
+.workspace-bar {
+  display: flex;
+  flex-shrink: 0;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  background: var(--tabs);
+  align-items: stretch;
+}
+.workspace-bar .workspace-tabs {
+  border-top: 0;
+  padding: 0 4px;
+  gap: 0;
+  min-width: 0;
+}
+.workspace-bar .workspace-tabs button {
+  padding: 11px 14px;
+  white-space: nowrap;
+}
+.workspace-bar .workspace-tabs .drop-target {
+  box-shadow: inset 3px 0 var(--accent);
+}
+.workspace-tools {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  padding: 0 6px;
+  gap: 2px;
+}
+.workspace-tools .icon-button {
+  padding: 6px;
+  width: 28px;
+  height: 30px;
+}
+.workspace-tools svg {
+  width: 15px;
+  height: 15px;
+}
+.workspace-detached {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  gap: 16px;
+  color: var(--muted);
+  text-align: center;
+}
+.workspace-detached > div {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.workspace-detached button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.workspace-detached button svg {
+  width: 15px;
+  height: 15px;
+}
+@media (max-width: 380px) {
+  .workspace-bar .workspace-tabs button {
+    padding: 11px 8px;
+    gap: 5px;
+  }
+  .workspace-tools {
+    padding: 0 3px;
+    gap: 0;
+  }
+}
+
+.workspace-host {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+.workspace-dock {
+  flex: 1;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+.workspace-dock.split-columns {
+  grid-template-columns:
+    minmax(0, calc(var(--dock-preview, var(--dock-ratio)) * 1% - 4px))
+    8px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.workspace-dock.split-rows {
+  grid-template-rows:
+    minmax(0, calc(var(--dock-preview, var(--dock-ratio)) * 1% - 4px))
+    8px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+.dock-slot {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.dock-group {
+  position: relative;
+  min-width: 0;
+}
+.dock-divider {
+  touch-action: none;
+  position: relative;
+  cursor: col-resize;
+  outline-offset: -2px;
+}
+.split-columns > .dock-divider {
+  grid-area: 1 / 2;
+}
+.split-rows > .dock-divider {
+  grid-area: 2 / 1;
+  cursor: row-resize;
+}
+.dock-divider::after {
+  content: "";
+  position: absolute;
+  inset: 30% 3px;
+  background: var(--line);
+  border-radius: 3px;
+}
+.split-rows > .dock-divider::after {
+  inset: 3px 30%;
+}
+.dock-divider:hover::after,
+.dock-divider:focus-visible::after {
+  background: var(--accent);
+}
+.dock-menu {
+  position: relative;
+}
+.dock-menu summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  list-style: none;
+  cursor: pointer;
+  width: 28px;
+  height: 30px;
+  color: var(--muted);
+  border-radius: 4px;
+}
+.dock-menu summary::-webkit-details-marker {
+  display: none;
+}
+.dock-menu summary:hover,
+.dock-menu[open] summary {
+  color: var(--text);
+  background: var(--panel);
+}
+.dock-menu-items {
+  position: absolute;
+  z-index: 50;
+  bottom: 36px;
+  right: 0;
+  width: max-content;
+  max-width: calc(100vw - 40px);
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 8px 30px #0004;
+  display: grid;
+}
+.dock-menu-items button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 9px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dock-menu-items button:hover {
+  background: var(--tabs);
+}
+.dock-targets {
+  visibility: hidden;
+  position: absolute;
+  z-index: 20;
+  inset: 8px 8px 44px;
+  background: #0002;
+  display: grid;
+  grid-template-columns: 1fr 46px 1fr;
+  grid-template-rows: 1fr 46px 1fr;
+  gap: 5px;
+  pointer-events: none;
+}
+.dock-slot[data-drag-over] > .dock-targets {
+  visibility: visible;
+}
+.dock-target {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  background: var(--tabs);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  opacity: 0.9;
+}
+.dock-target:hover {
+  background: var(--accent);
+}
+.dock-target svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+.dock-left {
+  grid-area: 2 / 1;
+}
+.dock-right {
+  grid-area: 2 / 3;
+}
+.dock-top {
+  grid-area: 1 / 2;
+}
+.dock-bottom {
+  grid-area: 3 / 2;
+}
+.dock-center {
+  grid-area: 2 / 2;
+}
+.dock-slot .workspace-detached {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-width: 0;
+}
+.dock-slot .workspace-detached > span {
+  overflow-wrap: anywhere;
+}
+/* Menus render in a portal so short dock slots cannot clip them. */
+body > .dock-menu-items {
+  bottom: auto;
+  right: auto;
+  width: 214px;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  z-index: 100;
+}
+.dock-group .workspace-content {
+  overflow: auto;
+}
+.dock-group .workspace-page {
+  min-height: 200px;
+}
+/* Split slots must override the legacy mobile conversation minimum. */
+.dock-group .conversation {
+  min-height: 0;
+  max-height: none;
+}
+.dock-group .composer,
+.dock-group .panel-header {
+  flex-shrink: 0;
+}
+/* Drop targets also cover the main slots of floating groups. */
+.dock-slot {
+  position: relative;
+}

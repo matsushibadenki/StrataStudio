@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod conversations;
+pub mod docking;
 pub mod inference;
 pub mod layout;
 pub mod local_model;
@@ -87,6 +88,8 @@ pub struct Document {
     pub generating: bool,
     #[serde(default)]
     pub layout: layout::Layout,
+    #[serde(skip)]
+    pub workspace_hosts: std::collections::BTreeMap<String, String>,
 }
 struct Process {
     child: Option<Child>,
@@ -100,6 +103,7 @@ pub struct Studio {
     pub token: String,
     pub settings: RwLock<Settings>,
     pub document: RwLock<Document>,
+    pub docking_diagnostics: Mutex<docking::DragDiagnostics>,
     process: Mutex<Process>,
     logs: Arc<Mutex<VecDeque<String>>>,
     client: reqwest::Client,
@@ -146,6 +150,7 @@ impl Studio {
             token: uuid::Uuid::new_v4().to_string(),
             settings: RwLock::new(settings),
             document: RwLock::new(Document::default()),
+            docking_diagnostics: Mutex::new(docking::DragDiagnostics::default()),
             process: Mutex::new(Process {
                 child: None,
                 key: String::new(),
@@ -195,7 +200,7 @@ impl Studio {
         *self.storage.get_mut() = Some(path);
         self
     }
-    async fn persist(&self) -> Result<(), String> {
+    pub async fn persist(&self) -> Result<(), String> {
         let storage = self.storage.lock().await;
         if let Some(path) = storage.as_ref() {
             if let Some(parent) = path.parent() {
@@ -496,7 +501,7 @@ impl Studio {
             .snapshot(self.memory_bytes, pid);
         let document = {
             let d = self.document.read().await;
-            json!({"messages":d.messages,"detached":d.detached,"generating":d.generating,"layout":d.layout,"conversations":d.conversations.summaries(&d.messages)})
+            json!({"messages":d.messages,"detached":d.detached,"generating":d.generating,"layout":d.layout,"workspaceGroups":d.layout.groups(),"workspaceHosts":d.workspace_hosts,"conversations":d.conversations.summaries(&d.messages)})
         };
         let requests = self
             .requests
@@ -506,7 +511,7 @@ impl Studio {
             .rev()
             .cloned()
             .collect::<Vec<_>>();
-        json!({"requests":requests,"memoryUsage":memory_usage,"memoryTuning":memory_tuning,"preparation":self.preparation.lock().await.snapshot(),"status":status,"health":health,"settings":*self.settings.read().await,"document":document,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
+        json!({"dockingDiagnostics":*self.docking_diagnostics.lock().await,"requests":requests,"memoryUsage":memory_usage,"memoryTuning":memory_tuning,"preparation":self.preparation.lock().await.snapshot(),"status":status,"health":health,"settings":*self.settings.read().await,"document":document,"logs":*self.logs.lock().await,"architecture":std::env::consts::ARCH,"memoryBytes":self.memory_bytes,"backend":if cfg!(all(target_os="macos",target_arch="aarch64")){"Metal"}else{"Strata"},"endpoint":format!("http://127.0.0.1:{}/v1",self.port),"root":self.root})
     }
 }
 fn pump<T: tokio::io::AsyncRead + Unpin + Send + 'static>(
@@ -560,6 +565,12 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
     if !authorized(&h, &s) {
         return error(StatusCode::UNAUTHORIZED, "Studio token required");
     }
+    if v["action"] == "traceDocking" {
+        let mut trace = s.docking_diagnostics.lock().await;
+        trace.enabled = v["enabled"].as_bool().unwrap_or(false);
+        trace.events.clear();
+        return Json(json!({"ok":true})).into_response();
+    }
     let result = match v["action"].as_str().unwrap_or("") {
         "start" => s.start().await,
         "applyMemoryRestart" => match serde_json::from_value(v["memory"].clone()) {
@@ -587,6 +598,43 @@ async fn action(State(s): State<Arc<Studio>>, h: HeaderMap, Json(v): Json<Value>
             .await
         }
         "cancelPreparation" => s.cancel_preparation().await,
+        "workspaceTab" | "moveWorkspaceTab" => {
+            let tab = v["tab"].as_str().unwrap_or("");
+            let before = if v["action"] == "moveWorkspaceTab" {
+                Some(v["before"].as_str().unwrap_or(""))
+            } else {
+                None
+            };
+            s.document.write().await.layout.workspace(tab, before)
+        }
+        "dockWorkspaceTab" | "resetWorkspace" => {
+            let mut d = s.document.write().await;
+            // Native windows must return to their slots before changing group membership.
+            if d.detached
+                .iter()
+                .any(|id| id == "workspace" || id.starts_with("group-"))
+            {
+                Err("Dock floating workspace groups before changing the split".into())
+            } else if v["action"] == "dockWorkspaceTab" {
+                d.layout.dock(
+                    v["tab"].as_str().unwrap_or(""),
+                    v["target"].as_str().unwrap_or(""),
+                    v["placement"].as_str().unwrap_or(""),
+                )
+            } else {
+                d.layout.workspace_order = layout::Layout::default().workspace_order;
+                d.layout.workspace_active = "chat".into();
+                d.layout.workspace_split = None;
+                d.layout.workspace_ratio = 50;
+                Ok(())
+            }
+        }
+        "resizeWorkspace" => s
+            .document
+            .write()
+            .await
+            .layout
+            .resize_workspace(v["ratio"].as_u64().unwrap_or(0)),
         "layout" => {
             let mut document = s.document.write().await;
             match document.layout.patch(&v["layout"]) {
@@ -1194,6 +1242,57 @@ mod tests {
         s.settings.write().await.config.clear();
         assert!(s.start().await.unwrap_err().contains("config"));
     }
+    #[tokio::test]
+    async fn docking_actions_preserve_messages_and_guard_native_group_membership() {
+        let studio = Arc::new(Studio::new(PathBuf::new(), 8081));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-studio-token", studio.token.parse().unwrap());
+        studio.document.write().await.messages.push(Message {
+            role: "user".into(),
+            content: "keep".into(),
+            inference: None,
+        });
+        let apply = |value| action(State(studio.clone()), headers.clone(), Json(value));
+        assert_eq!(apply(json!({"action":"dockWorkspaceTab","tab":"logs","target":"chat","placement":"right"})).await.status(), StatusCode::OK);
+        assert_eq!(studio.document.read().await.layout.groups().len(), 2);
+        studio
+            .document
+            .write()
+            .await
+            .detached
+            .push("group-logs".into());
+        for value in [
+            json!({"action":"resetWorkspace"}),
+            json!({"action":"dockWorkspaceTab","tab":"logs","target":"chat","placement":"center"}),
+        ] {
+            assert_eq!(apply(value).await.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            apply(json!({"action":"resizeWorkspace","ratio":61}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            apply(json!({"action":"workspaceTab","tab":"logs"}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        studio.document.write().await.detached.clear();
+        assert_eq!(apply(json!({"action":"dockWorkspaceTab","tab":"logs","target":"chat","placement":"center"})).await.status(), StatusCode::OK);
+        assert_eq!(
+            apply(json!({"action":"resizeWorkspace","ratio":999}))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let d = studio.document.read().await;
+        assert_eq!(d.messages.len(), 1);
+        assert_eq!(d.messages[0].content, "keep");
+        assert!(d.layout.workspace_split.is_none());
+        assert_eq!(d.layout.groups()[0].tabs, ["chat", "logs"]);
+    }
     #[test]
     fn authentication_requires_exact_token() {
         let s = Studio::new(PathBuf::new(), 8080);
@@ -1216,6 +1315,10 @@ mod tests {
             d.detached.push("api".into());
             d.generating = true;
             d.layout.engine_width = 340;
+            d.layout.workspace("logs", Some("chat")).unwrap();
+            d.layout.workspace("logs", None).unwrap();
+            d.layout.dock("logs", "chat", "left").unwrap();
+            d.layout.resize_workspace(60).unwrap();
         }
         s.persist().await.unwrap();
         let restored = Studio::new(PathBuf::new(), 8080).with_storage(path.clone());
@@ -1235,6 +1338,10 @@ mod tests {
         assert!(d.detached.is_empty());
         assert!(!d.generating);
         assert_eq!(d.layout.engine_width, 340);
+        assert_eq!(d.layout.workspace_order, ["logs", "chat"]);
+        assert_eq!(d.layout.workspace_active, "logs");
+        assert_eq!(d.layout.workspace_split.as_deref(), Some("horizontal"));
+        assert_eq!(d.layout.workspace_ratio, 60);
         assert_ne!(s.token, restored.token);
         std::fs::remove_file(path).unwrap();
     }

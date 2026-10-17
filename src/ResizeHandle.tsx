@@ -3,11 +3,19 @@ export type Layout = {
   engineWidth: number;
   apiWidth: number;
   logsHeight: number;
+  workspaceOrder: ("chat" | "logs")[];
+  workspaceActive: "chat" | "logs";
+  workspaceSplit: "horizontal" | "vertical" | null;
+  workspaceRatio: number;
 };
 export const defaultLayout: Layout = {
   engineWidth: 270,
   apiWidth: 300,
   logsHeight: 174,
+  workspaceOrder: ["chat", "logs"],
+  workspaceActive: "chat",
+  workspaceSplit: null,
+  workspaceRatio: 50,
 };
 export function ResizeHandle({
   axis,

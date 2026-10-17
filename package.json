@@ -14,7 +14,12 @@
     "test:roadmap": "node scripts/roadmap-smoke.mjs",
     "test:menus": "node scripts/menus-smoke.mjs",
     "test:models": "node scripts/models-smoke.mjs",
-    "test:reuse": "node scripts/reuse-smoke.mjs"
+    "test:reuse": "node scripts/reuse-smoke.mjs",
+    "test:workspace": "node scripts/workspace-smoke.mjs",
+    "test:docking": "node scripts/split-docking-smoke.mjs",
+    "test:floating": "node scripts/floating-docking-smoke.mjs",
+    "benchmark:inference": "node scripts/benchmark-inference.mjs",
+    "test:benchmark": "node --test scripts/benchmark-inference.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
